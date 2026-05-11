@@ -24,6 +24,9 @@ import type { Storage } from "./storage.js";
 import type { ObserverEvent } from "./types.js";
 import { safeStringify } from "./util.js";
 
+/** How many events the bus must contain before we consider it "warm". */
+const BUS_WARM_THRESHOLD = 1;
+
 export interface HttpServerOptions {
   port: number;
   bindHost: string;
@@ -143,8 +146,7 @@ export class ObserverHttpServer {
       return this.sendSessions(res, url);
     }
     if (url.pathname === "/api/tokens") {
-      const data = this.extras?.tokens() ?? {};
-      return this.sendJson(res, 200, data);
+      return this.sendTokens(res, url);
     }
     if (url.pathname === "/api/events") {
       return this.sendEvents(res, url);
@@ -202,18 +204,36 @@ export class ObserverHttpServer {
     });
   }
 
+  /**
+   * /api/events — return recent events.
+   *
+   * Source selection:
+   * - explicit `?source=bus` → always in-memory ring buffer.
+   * - explicit `?source=db`  → always persisted DB.
+   * - omitted              → DB when storage is ready; bus as fallback.
+   *   Additionally, if bus is empty (gateway just restarted) and storage is
+   *   ready, we automatically use DB even if no explicit source was given.
+   *
+   * Filters: `?limit=`, `?session=`, `?type=`, `?category=`, `?since=`
+   * (since is epoch-ms; sinceTs is epoch-ms too — same meaning).
+   */
   private sendEvents(res: ServerResponse, url: URL): void {
     const limit = clamp(parseIntOr(url.searchParams.get("limit"), 200), 1, 5000);
     const session = url.searchParams.get("session") ?? undefined;
     const type = url.searchParams.get("type") ?? undefined;
     const category = url.searchParams.get("category") ?? undefined;
     const since = parseIntOr(url.searchParams.get("since"), 0);
+    const requested = url.searchParams.get("source");
 
-    // Default source: in-memory ring (fast, newest). Only touch DB if the caller
-    // explicitly asks for persisted history or filters require it.
-    const source = url.searchParams.get("source") ?? (session || type || since ? "db" : "bus");
+    const busWarm = this.bus.recent(1).length >= BUS_WARM_THRESHOLD;
+    const storageReady = this.storage?.isReady() ?? false;
 
-    if (source === "bus" || !this.storage) {
+    // Determine which backing store to use
+    const useDb =
+      requested === "db" ||
+      (requested !== "bus" && storageReady && (!busWarm || session || type || since > 0));
+
+    if (!useDb || !this.storage) {
       let events = this.bus.recent(limit);
       if (type) events = events.filter((e) => e.type === type);
       if (category) events = events.filter((e) => e.category === category);
@@ -221,48 +241,35 @@ export class ObserverHttpServer {
       return this.sendJson(res, 200, { source: "bus", count: events.length, events });
     }
 
-    // DB path — rough MVP query. Keeps memory usage bounded via limit.
-    const events = this.queryDb({ limit, session, type, category, since });
+    const events = this.storage.queryRecentEvents({ limit, sinceTs: since, session, type, category });
     this.sendJson(res, 200, { source: "db", count: events.length, events });
   }
 
-  private queryDb(q: {
-    limit: number;
-    session?: string;
-    type?: string;
-    category?: string;
-    since: number;
-  }): ObserverEvent[] {
-    if (!this.storage) return [];
-    const db = (this.storage as unknown as { db: { prepare: (s: string) => { all: (...p: unknown[]) => unknown[] } } }).db;
-    const wheres: string[] = [];
-    const params: unknown[] = [];
-    if (q.since > 0) {
-      wheres.push("ts >= ?");
-      params.push(q.since);
+  /**
+   * /api/tokens — aggregated token usage.
+   *
+   * - DEFAULT (`source=db` or omitted): SQL aggregation from the events
+   *   table via `Storage.queryTokens()`. Survives gateway restarts.
+   * - `source=bus`: current process's in-memory `TokenAggregator` snapshot.
+   *   Resets on every restart; useful for comparing live vs persisted view,
+   *   or when storage is unavailable.
+   *
+   * Optional: `?since=<epoch-ms>` to limit the aggregation window (db only).
+   */
+  private sendTokens(res: ServerResponse, url: URL): void {
+    const requested = url.searchParams.get("source");
+    const since = parseIntOr(url.searchParams.get("since"), 0);
+    const storageReady = this.storage?.isReady() ?? false;
+
+    const useDb = requested !== "bus" && storageReady;
+
+    if (!useDb) {
+      const data = this.extras?.tokens() ?? {};
+      return this.sendJson(res, 200, { source: "bus", ...data });
     }
-    if (q.session) {
-      wheres.push("session_key = ?");
-      params.push(q.session);
-    }
-    if (q.type) {
-      wheres.push("type = ?");
-      params.push(q.type);
-    }
-    if (q.category) {
-      wheres.push("category = ?");
-      params.push(q.category);
-    }
-    const whereSql = wheres.length ? `WHERE ${wheres.join(" AND ")}` : "";
-    const sql = `SELECT * FROM events ${whereSql} ORDER BY ts DESC LIMIT ?`;
-    params.push(q.limit);
-    try {
-      const rows = db.prepare(sql).all(...params) as unknown as DbRow[];
-      return rows.map(rowToEvent).reverse(); // return newest last to match bus order
-    } catch (err) {
-      this.logger.warn(`[observer] db query failed: ${errMsg(err)}`);
-      return [];
-    }
+
+    const data = this.storage!.queryTokens({ sinceTs: since });
+    this.sendJson(res, 200, { source: "db", ...data });
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -270,10 +277,16 @@ export class ObserverHttpServer {
   // ────────────────────────────────────────────────────────────────────
 
   private onWsClient(socket: WebSocket): void {
-    // Backlog
     try {
-      const backlog = this.bus.recent(WS_INITIAL_BACKLOG);
-      socket.send(safeStringify({ type: "backlog", events: backlog }));
+      // Prefer in-memory ring; fall back to DB when the bus is empty
+      // (e.g. immediately after a gateway restart before any new events).
+      let backlog = this.bus.recent(WS_INITIAL_BACKLOG);
+      let backlogSource: "bus" | "db" = "bus";
+      if (backlog.length < BUS_WARM_THRESHOLD && this.storage?.isReady()) {
+        backlog = this.storage.queryRecentEvents({ limit: WS_INITIAL_BACKLOG });
+        backlogSource = "db";
+      }
+      socket.send(safeStringify({ type: "backlog", source: backlogSource, events: backlog }));
       socket.send(safeStringify({ type: "stats", stats: this.buildStats() }));
     } catch (err) {
       this.logger.warn(`[observer] ws backlog send failed: ${errMsg(err)}`);
@@ -347,71 +360,6 @@ export class ObserverHttpServer {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-
-interface DbRow {
-  id: string;
-  ts: number;
-  seq: number;
-  category: string;
-  type: string;
-  run_id: string | null;
-  session_key: string | null;
-  session_id: string | null;
-  agent_id: string | null;
-  channel: string | null;
-  trace_id: string | null;
-  parent_session_key: string | null;
-  tool_name: string | null;
-  tool_call_id: string | null;
-  tool_status: string | null;
-  provider: string | null;
-  model: string | null;
-  duration_ms: number | null;
-  tokens_input: number | null;
-  tokens_output: number | null;
-  tokens_cache_read: number | null;
-  tokens_cache_write: number | null;
-  tokens_total: number | null;
-  payload: string;
-}
-
-function rowToEvent(r: DbRow): ObserverEvent {
-  let payload: Record<string, unknown>;
-  try {
-    payload = JSON.parse(r.payload) as Record<string, unknown>;
-  } catch {
-    payload = { _raw: r.payload };
-  }
-  const tokens: ObserverEvent["tokens"] = {};
-  if (r.tokens_input != null) tokens.input = r.tokens_input;
-  if (r.tokens_output != null) tokens.output = r.tokens_output;
-  if (r.tokens_cache_read != null) tokens.cacheRead = r.tokens_cache_read;
-  if (r.tokens_cache_write != null) tokens.cacheWrite = r.tokens_cache_write;
-  if (r.tokens_total != null) tokens.total = r.tokens_total;
-  const evt: ObserverEvent = {
-    id: r.id,
-    ts: r.ts,
-    seq: r.seq,
-    category: r.category as "hook" | "diag",
-    type: r.type,
-    payload,
-  };
-  if (r.run_id) evt.runId = r.run_id;
-  if (r.session_key) evt.sessionKey = r.session_key;
-  if (r.session_id) evt.sessionId = r.session_id;
-  if (r.agent_id) evt.agentId = r.agent_id;
-  if (r.channel) evt.channel = r.channel;
-  if (r.trace_id) evt.traceId = r.trace_id;
-  if (r.parent_session_key) evt.parentSessionKey = r.parent_session_key;
-  if (r.tool_name) evt.toolName = r.tool_name;
-  if (r.tool_call_id) evt.toolCallId = r.tool_call_id;
-  if (r.tool_status) evt.toolStatus = r.tool_status as ObserverEvent["toolStatus"];
-  if (r.provider) evt.provider = r.provider;
-  if (r.model) evt.model = r.model;
-  if (r.duration_ms != null) evt.durationMs = r.duration_ms;
-  if (Object.keys(tokens).length) evt.tokens = tokens;
-  return evt;
-}
 
 function mimeOf(path: string): string {
   const ext = extname(path).toLowerCase();

@@ -251,6 +251,159 @@ export class Storage {
   }
 
   /**
+   * Read recent events out of the persisted store, returned newest-last
+   * to match the in-memory bus order. Used by:
+   *  - `GET /api/events` when the caller asks for `source=db` (or when
+   *    the in-memory ring buffer is empty after a restart and the
+   *    handler falls back automatically).
+   *  - The WebSocket initial backlog, which prefers `bus.recent()` and
+   *    falls back to this when the bus has nothing yet.
+   *
+   * Filters are AND-ed; any of them may be omitted. The composite
+   * (session_key, ts) and (type, ts) indexes cover the common cases.
+   * Returns [] when storage is not ready (memory-only fallback).
+   */
+  queryRecentEvents(opts: {
+    limit?: number;
+    sinceTs?: number;
+    session?: string;
+    type?: string;
+    category?: string;
+  } = {}): ObserverEvent[] {
+    if (!this.ready || !this.db) return [];
+    const limit = clampInt(opts.limit, 1, 5000, 200);
+    const wheres: string[] = [];
+    const params: unknown[] = [];
+    if (opts.sinceTs && opts.sinceTs > 0) {
+      wheres.push("ts >= ?");
+      params.push(opts.sinceTs);
+    }
+    if (opts.session) {
+      wheres.push("session_key = ?");
+      params.push(opts.session);
+    }
+    if (opts.type) {
+      wheres.push("type = ?");
+      params.push(opts.type);
+    }
+    if (opts.category) {
+      wheres.push("category = ?");
+      params.push(opts.category);
+    }
+    const whereSql = wheres.length ? `WHERE ${wheres.join(" AND ")}` : "";
+    const sql = `SELECT * FROM events ${whereSql} ORDER BY ts DESC LIMIT ?`;
+    params.push(limit);
+    try {
+      const rows = this.db.prepare(sql).all(...params) as DbEventRow[];
+      // Reverse so the newest event is last — matches `bus.recent()` order
+      // and lets the dashboard append-render without re-sorting.
+      return rows.map(rowToEvent).reverse();
+    } catch (err) {
+      this.logger.warn(`[observer] queryRecentEvents failed: ${errMsg(err)}`);
+      return [];
+    }
+  }
+
+  /**
+   * SQL-aggregate token usage straight out of the events table, in the
+   * same shape that `TokenAggregator.snapshotAsJson()` produces. Survives
+   * gateway restarts; the in-memory aggregator is reset to zero on every
+   * restart whereas this method always reflects the full retention window.
+   *
+   * Aggregation rules mirror the in-memory code path:
+   *  - Source rows: only `type='llm_output'` events with at least one
+   *    non-null token column (otherwise `calls` would inflate).
+   *  - Buckets: `overall`, `bySession[sessionKey]`, `byAgent[agentId]`,
+   *    `byModel["provider/model"]`. Rows with NULL keys are skipped for
+   *    the per-key buckets but still counted in `overall`.
+   *  - Windows: `lastHour` / `lastDay` are computed with a `ts >= ?`
+   *    cut-off in SQL, so the figures are absolute (last 1h / last 24h
+   *    from now) — slightly different from the in-memory aggregator
+   *    which uses fixed-edge buckets, but easier to reason about and
+   *    matches what users expect when they look at "last hour".
+   *  - `total`: prefer `tokens_total` if non-NULL, else `input + output`,
+   *    matching `addInto()`.
+   */
+  queryTokens(opts: { sinceTs?: number } = {}): TokenSnapshot {
+    if (!this.ready || !this.db) return emptyTokenSnapshot();
+    const sinceTs = opts.sinceTs && opts.sinceTs > 0 ? opts.sinceTs : 0;
+    const now = Date.now();
+    const hourCutoff = now - 60 * 60 * 1000;
+    const dayCutoff = now - 24 * 60 * 60 * 1000;
+
+    // SUM expressions are reused by every grouping; defined once for clarity.
+    // SQLite has no FILTER (bool), so we use CASE to mask rows outside the
+    // window. tokens_total falls back to input+output to mirror addInto().
+    const SUM_EXPR = `
+      COALESCE(SUM(tokens_input), 0)        AS t_in,
+      COALESCE(SUM(tokens_output), 0)       AS t_out,
+      COALESCE(SUM(tokens_cache_read), 0)   AS t_cr,
+      COALESCE(SUM(tokens_cache_write), 0)  AS t_cw,
+      COALESCE(SUM(COALESCE(tokens_total, COALESCE(tokens_input,0) + COALESCE(tokens_output,0))), 0) AS t_tot,
+      COUNT(*) AS calls
+    `;
+    const BASE_WHERE = `
+      WHERE type = 'llm_output'
+        AND ts >= ?
+        AND (tokens_input IS NOT NULL OR tokens_output IS NOT NULL OR tokens_total IS NOT NULL)
+    `;
+
+    try {
+      const overallRow = this.db
+        .prepare(`SELECT ${SUM_EXPR} FROM events ${BASE_WHERE}`)
+        .get(sinceTs) as TokenAggRow | undefined;
+
+      const hourRow = this.db
+        .prepare(`SELECT ${SUM_EXPR} FROM events ${BASE_WHERE} AND ts >= ?`)
+        .get(sinceTs, hourCutoff) as TokenAggRow | undefined;
+
+      const dayRow = this.db
+        .prepare(`SELECT ${SUM_EXPR} FROM events ${BASE_WHERE} AND ts >= ?`)
+        .get(sinceTs, dayCutoff) as TokenAggRow | undefined;
+
+      const sessionRows = this.db
+        .prepare(
+          `SELECT session_key AS k, ${SUM_EXPR} FROM events ${BASE_WHERE} AND session_key IS NOT NULL GROUP BY session_key`,
+        )
+        .all(sinceTs) as TokenAggKeyedRow[];
+
+      const agentRows = this.db
+        .prepare(
+          `SELECT agent_id AS k, ${SUM_EXPR} FROM events ${BASE_WHERE} AND agent_id IS NOT NULL GROUP BY agent_id`,
+        )
+        .all(sinceTs) as TokenAggKeyedRow[];
+
+      // Model key is "provider/model" (or just one of them) — match the
+      // in-memory `formatModelKey()` exactly.
+      const modelRows = this.db
+        .prepare(
+          `SELECT
+             CASE
+               WHEN provider IS NOT NULL AND model IS NOT NULL THEN provider || '/' || model
+               WHEN model IS NOT NULL THEN model
+               WHEN provider IS NOT NULL THEN provider
+             END AS k,
+             ${SUM_EXPR}
+           FROM events ${BASE_WHERE} AND (provider IS NOT NULL OR model IS NOT NULL)
+           GROUP BY k`,
+        )
+        .all(sinceTs) as TokenAggKeyedRow[];
+
+      return {
+        overall: rowToBucket(overallRow),
+        lastHour: { totals: rowToBucket(hourRow), windowStart: hourCutoff, windowEnd: now },
+        lastDay: { totals: rowToBucket(dayRow), windowStart: dayCutoff, windowEnd: now },
+        bySession: keyedRowsToBuckets(sessionRows),
+        byAgent: keyedRowsToBuckets(agentRows),
+        byModel: keyedRowsToBuckets(modelRows),
+      };
+    } catch (err) {
+      this.logger.warn(`[observer] queryTokens failed: ${errMsg(err)}`);
+      return emptyTokenSnapshot();
+    }
+  }
+
+  /**
    * Derive a SessionState[] directly from persisted events.
    *
    * Why this exists: the in-memory `SessionTracker` only tracks events the
@@ -581,4 +734,127 @@ function clampInt(value: number | undefined, lo: number, hi: number, dflt: numbe
   if (value == null || !Number.isFinite(value)) return dflt;
   const n = Math.floor(value);
   return Math.max(lo, Math.min(hi, n));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// queryRecentEvents support: Row → ObserverEvent (mirrors http-server.ts)
+// ────────────────────────────────────────────────────────────────────────
+
+// DbEventRow is the same shape as Row — aliased here for readability
+// in queryRecentEvents.
+type DbEventRow = Row;
+
+export function rowToEvent(r: DbEventRow): ObserverEvent {
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(r.payload) as Record<string, unknown>;
+  } catch {
+    payload = { _raw: r.payload };
+  }
+  const tokens: ObserverEvent["tokens"] = {};
+  if (r.tokens_input != null) tokens.input = r.tokens_input;
+  if (r.tokens_output != null) tokens.output = r.tokens_output;
+  if (r.tokens_cache_read != null) tokens.cacheRead = r.tokens_cache_read;
+  if (r.tokens_cache_write != null) tokens.cacheWrite = r.tokens_cache_write;
+  if (r.tokens_total != null) tokens.total = r.tokens_total;
+  const evt: ObserverEvent = {
+    id: r.id,
+    ts: r.ts,
+    seq: r.seq,
+    category: r.category as "hook" | "diag",
+    type: r.type,
+    payload,
+  };
+  if (r.run_id) evt.runId = r.run_id;
+  if (r.session_key) evt.sessionKey = r.session_key;
+  if (r.session_id) evt.sessionId = r.session_id;
+  if (r.agent_id) evt.agentId = r.agent_id;
+  if (r.channel) evt.channel = r.channel;
+  if (r.trace_id) evt.traceId = r.trace_id;
+  if (r.parent_session_key) evt.parentSessionKey = r.parent_session_key;
+  if (r.tool_name) evt.toolName = r.tool_name;
+  if (r.tool_call_id) evt.toolCallId = r.tool_call_id;
+  if (r.tool_status) evt.toolStatus = r.tool_status as ObserverEvent["toolStatus"];
+  if (r.provider) evt.provider = r.provider;
+  if (r.model) evt.model = r.model;
+  if (r.duration_ms != null) evt.durationMs = r.duration_ms;
+  if (Object.keys(tokens).length) evt.tokens = tokens;
+  return evt;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// queryTokens support: types + helpers
+// ────────────────────────────────────────────────────────────────────────
+
+export interface TokenBucket {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+  calls: number;
+}
+
+export interface TokenWindowSnapshot {
+  totals: TokenBucket;
+  windowStart: number;
+  windowEnd: number;
+}
+
+export interface TokenSnapshot {
+  overall: TokenBucket;
+  lastHour: TokenWindowSnapshot;
+  lastDay: TokenWindowSnapshot;
+  bySession: Record<string, TokenBucket>;
+  byAgent: Record<string, TokenBucket>;
+  byModel: Record<string, TokenBucket>;
+}
+
+interface TokenAggRow {
+  t_in: number;
+  t_out: number;
+  t_cr: number;
+  t_cw: number;
+  t_tot: number;
+  calls: number;
+}
+
+interface TokenAggKeyedRow extends TokenAggRow {
+  k: string;
+}
+
+function emptyBucket(): TokenBucket {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, calls: 0 };
+}
+
+function emptyTokenSnapshot(): TokenSnapshot {
+  const now = Date.now();
+  return {
+    overall: emptyBucket(),
+    lastHour: { totals: emptyBucket(), windowStart: now - 3_600_000, windowEnd: now },
+    lastDay: { totals: emptyBucket(), windowStart: now - 86_400_000, windowEnd: now },
+    bySession: {},
+    byAgent: {},
+    byModel: {},
+  };
+}
+
+function rowToBucket(r: TokenAggRow | undefined): TokenBucket {
+  if (!r) return emptyBucket();
+  return {
+    input: r.t_in,
+    output: r.t_out,
+    cacheRead: r.t_cr,
+    cacheWrite: r.t_cw,
+    total: r.t_tot,
+    calls: r.calls,
+  };
+}
+
+function keyedRowsToBuckets(rows: TokenAggKeyedRow[]): Record<string, TokenBucket> {
+  const out: Record<string, TokenBucket> = {};
+  for (const r of rows) {
+    if (r.k) out[r.k] = rowToBucket(r);
+  }
+  return out;
 }

@@ -5,6 +5,37 @@ All notable changes to this plugin will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-11
+
+### Added
+- `Storage.queryRecentEvents(opts)` — reads persisted events from the
+  SQLite table with optional `limit` / `sinceTs` / `session` / `type` /
+  `category` filters. Returns results newest-last to match the in-memory
+  ring buffer order. Used by `/api/events` and the WebSocket backlog
+  when the in-memory bus is empty.
+- `Storage.queryTokens(opts)` — SQL aggregation of token usage direct
+  from the `events` table, producing the same
+  `{ overall, lastHour, lastDay, bySession, byAgent, byModel }` shape
+  as `TokenAggregator.snapshotAsJson()`. Unlike the in-memory aggregator,
+  this view is never reset by a gateway restart and reflects the full
+  retention window.
+
+### Changed
+- `/api/events` now auto-falls-back to `source=db` when the in-memory
+  ring buffer is empty (i.e. right after a gateway restart). Also supports
+  explicit `?source=bus|db`; `?session=`, `?type=`, `?category=`, `?since=`
+  filters always route to DB. Response gains a `source` field.
+- `/api/tokens` defaults to `source=db` (was: in-memory aggregator).
+  Token totals are now preserved across gateway restarts. Use
+  `?source=bus` to get the live in-memory view, or `?since=<epoch-ms>`
+  to restrict the DB aggregation window. Response gains a `source` field.
+- WebSocket initial backlog falls back to `Storage.queryRecentEvents()`
+  when the bus is empty, so a freshly restarted gateway still sends
+  historical events to newly connected dashboard clients. The backlog
+  message gains a `source` field (`"bus"` or `"db"`).
+- Removed duplicated `DbRow` interface and `rowToEvent()` helper from
+  `http-server.ts`; both now live in `storage.ts` and are shared.
+
 ## [0.3.0] — 2026-05-11
 
 ### Added
