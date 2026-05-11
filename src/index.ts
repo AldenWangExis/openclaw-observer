@@ -43,7 +43,7 @@ interface ObserverConfig {
 const DEFAULTS: ObserverConfig = {
   enabled: true,
   port: 10010,
-  bindHost: "127.0.0.1",
+  bindHost: "0.0.0.0",
   dbPath: "",
   retentionDays: 7,
   bufferSize: 5000,

@@ -9,7 +9,8 @@ OpenClaw Observer is a Gateway plugin that runs **in-process** with your
 OpenClaw Gateway. It subscribes to Plugin Hooks (full content) and
 Diagnostic Events (timing/metadata), buffers them in memory, persists
 them to a local SQLite database, and serves a zero-build single-page
-dashboard on `http://127.0.0.1:10010`.
+dashboard on `http://localhost:10010` (binds to all interfaces by
+default — see [Security](#security-notes) before exposing it).
 
 No external service. No extra agent. No code change to your existing
 plugins. Drop it in and watch your agents work.
@@ -57,7 +58,7 @@ openclaw plugins enable openclaw-observer
 openclaw gateway restart
 ```
 
-Then open <http://127.0.0.1:10010>.
+Then open <http://localhost:10010>.
 
 ### Option B — Install from a local checkout
 
@@ -76,18 +77,31 @@ to hack on it.
 
 ### Open the dashboard
 
-```
-http://127.0.0.1:10010
-```
+By default Observer binds to **all interfaces** (`0.0.0.0:10010`),
+so any of these work:
 
-For remote access, prefer an SSH tunnel:
-
-```bash
-ssh -L 10010:127.0.0.1:10010 your-host
+```
+http://localhost:10010
+http://<host-ip>:10010
 ```
 
-…or change `bindHost` to `0.0.0.0` (see config below) **and** firewall
-the port — Observer has **no auth** in v1.
+> ⚠️ Observer has **no auth** in v1. The default open bind is convenient
+> for single-machine ops but **must be firewalled** in any shared
+> network. Lock it down by either:
+>
+> - **Restricting to loopback** — set `bindHost: "127.0.0.1"` in your
+>   OpenClaw config (see below) and use an SSH tunnel for remote
+>   access:
+>   ```bash
+>   ssh -L 10010:127.0.0.1:10010 your-host
+>   ```
+> - **Binding to a specific NIC** — set `bindHost` to the NIC's IP
+>   (e.g. `"10.0.1.23"`) so the public NIC never sees the port.
+> - **Front with a reverse proxy** that adds auth (nginx/Caddy +
+>   BasicAuth/OIDC) and keep Observer on `127.0.0.1`.
+>
+> See the [Security notes](#security-notes) section for the full
+> threat model.
 
 ---
 
@@ -127,7 +141,7 @@ Add to your OpenClaw config (the plugin reads its own subtree):
         "enabled": true,
         "config": {
           "port": 10010,
-          "bindHost": "127.0.0.1",
+          "bindHost": "0.0.0.0",
           "retentionDays": 7,
           "captureContent": true,
           "redact": {
@@ -148,7 +162,7 @@ plus `gateway config.patch` to merge any of these keys.
 |---|---|---|
 | `enabled` | `true` | Master switch |
 | `port` | `10010` | HTTP/WebSocket port |
-| `bindHost` | `127.0.0.1` | `0.0.0.0` to expose on all interfaces (firewall this!) |
+| `bindHost` | `0.0.0.0` | All interfaces by default. Set to `127.0.0.1` for loopback-only or to a specific NIC IP (firewall the port — there is no auth) |
 | `dbPath` | `""` | Absolute path to SQLite DB. Empty = `<plugin>/data/observer.db` |
 | `retentionDays` | `7` | TTL in days (1–365) |
 | `bufferSize` | `5000` | In-memory ring buffer (100–100000) |
@@ -213,7 +227,7 @@ interface ObserverEvent {
 │  │                                                          │        │
 │  └────────────────────────────┬─────────────────────────────┘        │
 │                               ↓                                      │
-│   HTTP/WS server on 127.0.0.1:10010 → static SPA + REST + /stream    │
+│   HTTP/WS server on 0.0.0.0:10010 (default) → SPA + REST + /stream  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -240,11 +254,22 @@ RAM** and **<2 % CPU**.
 
 ## Security notes
 
-- **No auth in v1.** Bind to `127.0.0.1` and tunnel; do **not** expose
-  this port to the internet.
+- **No auth in v1.** Observer trusts everything that can reach its
+  port. Anyone who hits `:10010` can read every prompt, tool call,
+  model output and token total.
+- **Default bind is `0.0.0.0`.** This is convenient for single-host
+  workflows but means **the port is exposed to every network the host
+  can reach** unless you firewall it. Lock it down with one of:
+  - `bindHost: "127.0.0.1"` + SSH tunnel
+    (`ssh -L 10010:127.0.0.1:10010 your-host`)
+  - `bindHost: "<internal-NIC-IP>"` so only the internal network sees it
+  - reverse proxy (nginx / Caddy) with BasicAuth or OIDC in front
+  - host-level firewall rules limiting source IPs (`iptables`, `ufw`,
+    cloud security groups)
 - Redaction runs **before** anything reaches the bus, the database or
   WebSocket clients. The full unredacted payload never leaves the hook
-  callback frame.
+  callback frame, but redaction is best-effort regex-based — assume a
+  determined reader of the dashboard can still glean intent.
 - Set `captureContent: false` to record only metadata (durations,
   token counts, types) and skip every prompt/tool body — useful when
   the gateway is processing third-party PII.
@@ -295,7 +320,7 @@ There is no automated test harness in v1 — the design is validated
 end-to-end by:
 
 1. start the gateway with the plugin enabled
-2. open `http://127.0.0.1:10010`
+2. open `http://localhost:10010`
 3. send a message that triggers tool calls / sub-agents
 4. confirm events stream in, token totals add up, and the SQLite row
    count grows in the status bar

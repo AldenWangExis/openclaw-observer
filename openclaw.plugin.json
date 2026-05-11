@@ -2,7 +2,7 @@
   "id": "openclaw-observer",
   "name": "OpenClaw Observer",
   "description": "Real-time observability dashboard for agent runs, tool calls, model I/O, and diagnostic events",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "activation": {
     "onStartup": true
   },
@@ -28,8 +28,8 @@
       },
       "bindHost": {
         "type": "string",
-        "default": "127.0.0.1",
-        "description": "Bind address. Use 127.0.0.1 for loopback only, 0.0.0.0 for all interfaces"
+        "default": "0.0.0.0",
+        "description": "Bind address. Default 0.0.0.0 (all interfaces); set to 127.0.0.1 for loopback-only. Observer has no auth — firewall the port or use a reverse proxy if exposed."
       },
       "dbPath": {
         "type": "string",
