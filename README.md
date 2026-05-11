@@ -180,8 +180,8 @@ The dashboard is just a client; you can build your own.
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/sessions` | GET | All known sessions with status, token totals, lifecycle markers |
-| `/api/events` | GET | Paged historical events (`?since=<ts>&limit=…&type=…`) |
+| `/api/sessions` | GET | All known sessions with status, token totals, lifecycle markers. Default `source=db` — derived from the persisted events table so it survives gateway restarts. Pass `?source=bus` for the in-process `SessionTracker` snapshot, `?limit=` (1–1000) and `?since=<ts>` to scope. |
+| `/api/events` | GET | Paged historical events (`?since=<ts>&limit=…&type=…&source=bus\|db`) |
 | `/api/session/:sessionKey` | GET | Single-session summary + recent events |
 | `/api/tokens` | GET | Aggregated token usage by model |
 | `/stream` | WS | Live event stream (events + periodic stats) |

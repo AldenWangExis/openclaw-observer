@@ -17,7 +17,7 @@ import type { Database as SqliteDatabase, Statement } from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import type { ObserverEvent } from "./types.js";
+import type { ObserverEvent, SessionState, SessionStatus } from "./types.js";
 import { safeStringify } from "./util.js";
 
 const SCHEMA_SQL = `
@@ -250,6 +250,150 @@ export class Storage {
     };
   }
 
+  /**
+   * Derive a SessionState[] directly from persisted events.
+   *
+   * Why this exists: the in-memory `SessionTracker` only tracks events the
+   * current process saw. After a gateway restart its Map is empty even
+   * though SQLite still has the history, so the dashboard's session list
+   * goes blank until new traffic arrives. This method runs one composite
+   * query and rebuilds the same shape from the events table — survives
+   * restarts, lives as long as `retentionDays`.
+   *
+   * Field mapping (must match `SessionTracker.apply()` semantics):
+   * - firstSeen   = MIN(ts)
+   * - lastSeen    = MAX(ts)
+   * - eventCount  = COUNT(*)
+   * - tokens.*    = SUM(...)
+   * - parentSessionKey / agentId / channel = any non-null value
+   *   (MIN ignores NULL in SQLite; for these "sticky" identity fields
+   *   that's fine — a session has at most one of each in practice)
+   * - status / currentAction / currentActionStart = derived from the most
+   *   recent status-bearing hook event, mirroring the tracker's "last
+   *   event wins" logic
+   * - title       = first text-like field of the earliest message_received
+   *   payload, mirroring `firstTextPreview()` in the tracker
+   *
+   * Performance: composite query uses three window-function sub-queries
+   * (last_status, last_action, first_msg). All indexed on session_key/ts.
+   * For ~10⁵ rows the query is sub-millisecond on a warm cache; for ~10⁶
+   * still well under 100ms.
+   *
+   * Returns [] if storage is not ready (memory-only fallback) — caller
+   * should then fall back to the in-memory tracker.
+   */
+  querySessions(opts: { limit?: number; sinceTs?: number } = {}): SessionState[] {
+    if (!this.ready || !this.db) return [];
+    const limit = clampInt(opts.limit, 1, 1000, 200);
+    const sinceTs = opts.sinceTs && opts.sinceTs > 0 ? opts.sinceTs : 0;
+
+    // Type IDs that the tracker reads. Keep these in sync with the
+    // STATUS_FROM_HOOK / currentAction logic in session-tracker.ts.
+    const STATUS_TYPES = [
+      "session_start",
+      "session_end",
+      "message_received",
+      "message_sent",
+      "llm_input",
+      "llm_output",
+      "before_tool_call",
+      "after_tool_call",
+      "before_compaction",
+      "after_compaction",
+    ];
+    const ACTION_TYPES = [
+      "before_tool_call",
+      "after_tool_call",
+      "llm_input",
+      "llm_output",
+      "session_end",
+    ];
+
+    // Build IN (?, ?, …) placeholders so prepared-statement caching still works.
+    const statusPlaceholders = STATUS_TYPES.map(() => "?").join(",");
+    const actionPlaceholders = ACTION_TYPES.map(() => "?").join(",");
+
+    const sql = `
+      WITH base AS (
+        SELECT
+          session_key,
+          MIN(ts) AS first_seen,
+          MAX(ts) AS last_seen,
+          COUNT(*) AS event_count,
+          COALESCE(SUM(tokens_input), 0) AS t_in,
+          COALESCE(SUM(tokens_output), 0) AS t_out,
+          COALESCE(SUM(tokens_cache_read), 0) AS t_cr,
+          COALESCE(SUM(tokens_cache_write), 0) AS t_cw,
+          COALESCE(SUM(tokens_total), 0) AS t_tot,
+          MIN(parent_session_key) AS parent_session_key,
+          MIN(agent_id) AS agent_id,
+          MIN(channel) AS channel
+        FROM events
+        WHERE session_key IS NOT NULL AND ts >= ?
+        GROUP BY session_key
+      ),
+      last_status AS (
+        SELECT session_key, type, ts FROM (
+          SELECT session_key, type, ts,
+                 ROW_NUMBER() OVER (PARTITION BY session_key ORDER BY ts DESC, seq DESC) AS rn
+          FROM events
+          WHERE category = 'hook' AND type IN (${statusPlaceholders}) AND ts >= ?
+        ) WHERE rn = 1
+      ),
+      last_action AS (
+        SELECT session_key, type, ts, tool_name, model FROM (
+          SELECT session_key, type, ts, tool_name, model,
+                 ROW_NUMBER() OVER (PARTITION BY session_key ORDER BY ts DESC, seq DESC) AS rn
+          FROM events
+          WHERE category = 'hook' AND type IN (${actionPlaceholders}) AND ts >= ?
+        ) WHERE rn = 1
+      ),
+      first_msg AS (
+        SELECT session_key, payload FROM (
+          SELECT session_key, payload,
+                 ROW_NUMBER() OVER (PARTITION BY session_key ORDER BY ts ASC, seq ASC) AS rn
+          FROM events
+          WHERE category = 'hook' AND type = 'message_received' AND ts >= ?
+        ) WHERE rn = 1
+      )
+      SELECT
+        base.session_key,
+        base.first_seen, base.last_seen, base.event_count,
+        base.t_in, base.t_out, base.t_cr, base.t_cw, base.t_tot,
+        base.parent_session_key, base.agent_id, base.channel,
+        last_status.type   AS status_type,
+        last_action.type   AS action_type,
+        last_action.ts     AS action_ts,
+        last_action.tool_name AS action_tool,
+        last_action.model     AS action_model,
+        first_msg.payload AS first_msg_payload
+      FROM base
+      LEFT JOIN last_status ON last_status.session_key = base.session_key
+      LEFT JOIN last_action ON last_action.session_key = base.session_key
+      LEFT JOIN first_msg   ON first_msg.session_key   = base.session_key
+      ORDER BY base.last_seen DESC
+      LIMIT ?
+    `;
+
+    try {
+      const rows = this.db
+        .prepare(sql)
+        .all(
+          sinceTs,
+          ...STATUS_TYPES,
+          sinceTs,
+          ...ACTION_TYPES,
+          sinceTs,
+          sinceTs,
+          limit,
+        ) as SessionRow[];
+      return rows.map(rowToSessionState);
+    } catch (err) {
+      this.logger.warn(`[observer] querySessions failed: ${errMsg(err)}`);
+      return [];
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -331,4 +475,110 @@ function toRow(e: ObserverEvent): Row {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// querySessions support: row mapping + helpers
+// ────────────────────────────────────────────────────────────────────────
+
+interface SessionRow {
+  session_key: string;
+  first_seen: number;
+  last_seen: number;
+  event_count: number;
+  t_in: number;
+  t_out: number;
+  t_cr: number;
+  t_cw: number;
+  t_tot: number;
+  parent_session_key: string | null;
+  agent_id: string | null;
+  channel: string | null;
+  status_type: string | null;
+  action_type: string | null;
+  action_ts: number | null;
+  action_tool: string | null;
+  action_model: string | null;
+  first_msg_payload: string | null;
+}
+
+/** Mirror of `STATUS_FROM_HOOK` in session-tracker.ts. */
+const STATUS_FROM_HOOK: Record<string, SessionStatus> = {
+  session_start: "active",
+  session_end: "done",
+  message_received: "thinking",
+  message_sent: "idle",
+  llm_input: "thinking",
+  llm_output: "active",
+  before_tool_call: "tool",
+  after_tool_call: "active",
+  before_compaction: "thinking",
+  after_compaction: "active",
+};
+
+function rowToSessionState(r: SessionRow): SessionState {
+  const state: SessionState = {
+    sessionKey: r.session_key,
+    firstSeen: r.first_seen,
+    lastSeen: r.last_seen,
+    eventCount: r.event_count,
+    status: r.status_type ? (STATUS_FROM_HOOK[r.status_type] ?? "active") : "active",
+    tokens: {
+      input: r.t_in,
+      output: r.t_out,
+      cacheRead: r.t_cr,
+      cacheWrite: r.t_cw,
+      total: r.t_tot,
+    },
+  };
+  if (r.parent_session_key) state.parentSessionKey = r.parent_session_key;
+  if (r.agent_id) state.agentId = r.agent_id;
+  if (r.channel) state.channel = r.channel;
+
+  // currentAction / currentActionStart: replay the action_type's effect
+  // exactly like session-tracker.ts does in `apply()`.
+  if (r.action_type === "before_tool_call" && r.action_tool) {
+    state.currentAction = `tool:${r.action_tool}`;
+    if (r.action_ts != null) state.currentActionStart = r.action_ts;
+  } else if (r.action_type === "llm_input") {
+    state.currentAction = `llm:${r.action_model ?? ""}`;
+    if (r.action_ts != null) state.currentActionStart = r.action_ts;
+  }
+  // after_tool_call / llm_output / session_end → leave currentAction
+  // undefined (the tracker would have cleared them too).
+
+  if (r.first_msg_payload) {
+    const title = extractTitle(r.first_msg_payload);
+    if (title) state.title = title;
+  }
+
+  return state;
+}
+
+/** Mirror of `firstTextPreview()` in session-tracker.ts, but parses JSON first. */
+function extractTitle(payloadJson: string): string | undefined {
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(payloadJson) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+  for (const k of ["text", "message", "content", "prompt", "body"]) {
+    const v = payload[k];
+    if (typeof v === "string" && v.trim().length > 0) {
+      return v.slice(0, 80);
+    }
+  }
+  const msg = payload["message"];
+  if (msg && typeof msg === "object") {
+    const text = (msg as Record<string, unknown>)["text"];
+    if (typeof text === "string") return text.slice(0, 80);
+  }
+  return undefined;
+}
+
+function clampInt(value: number | undefined, lo: number, hi: number, dflt: number): number {
+  if (value == null || !Number.isFinite(value)) return dflt;
+  const n = Math.floor(value);
+  return Math.max(lo, Math.min(hi, n));
 }

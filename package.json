@@ -1,6 +1,6 @@
 {
   "name": "openclaw-observer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Real-time observability dashboard for OpenClaw — see every prompt, tool call, token usage and diagnostic event live on http://127.0.0.1:10010",
   "type": "module",
   "main": "./dist/index.js",

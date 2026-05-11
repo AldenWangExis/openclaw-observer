@@ -5,6 +5,30 @@ All notable changes to this plugin will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-11
+
+### Added
+- `Storage.querySessions(opts)` derives the same `SessionState[]` shape
+  the in-memory `SessionTracker` produces, but directly from the
+  persisted `events` table via a single composite SQL query
+  (window-function based). Field semantics — `firstSeen` / `lastSeen` /
+  `eventCount` / `tokens.*` aggregates, `parentSessionKey` / `agentId` /
+  `channel` sticky identity, `status` / `currentAction` /
+  `currentActionStart` derived from the latest status-bearing hook
+  event, `title` from the earliest `message_received` payload — are
+  kept in lock-step with `SessionTracker.apply()`.
+- `/api/sessions` now accepts `?source=bus|db`, `?limit=` (1–1000) and
+  `?since=<epoch-ms>`. Response gains a `source` field describing which
+  backend served the request.
+
+### Changed
+- `/api/sessions` defaults to `source=db` (was: in-memory tracker).
+  After a gateway restart the dashboard now sees historical sessions
+  immediately instead of going blank until new traffic arrives.
+  `source=bus` and the in-memory `SessionTracker` are still available
+  for live debugging and as a fallback when storage is unavailable
+  (memory-only mode).
+
 ## [0.2.0] — 2026-05-11
 
 ### Changed

@@ -140,8 +140,7 @@ export class ObserverHttpServer {
       return this.sendJson(res, 200, this.buildStats());
     }
     if (url.pathname === "/api/sessions") {
-      const data = this.extras?.sessions() ?? [];
-      return this.sendJson(res, 200, { count: Array.isArray(data) ? data.length : 0, sessions: data });
+      return this.sendSessions(res, url);
     }
     if (url.pathname === "/api/tokens") {
       const data = this.extras?.tokens() ?? {};
@@ -163,6 +162,44 @@ export class ObserverHttpServer {
       storage: this.storage?.stats() ?? { rowCount: 0, dbPath: "<disabled>" },
       ts: Date.now(),
     };
+  }
+
+  /**
+   * /api/sessions  — list known sessions, newest active first.
+   *
+   * Two backing stores, behaviour mirrors /api/events:
+   * - `source=db` (DEFAULT) — derived from the persisted events table via
+   *   `Storage.querySessions()`. Survives gateway restarts; this is what
+   *   the dashboard wants 99 % of the time.
+   * - `source=bus` — current process's in-memory `SessionTracker`
+   *   snapshot. Same shape, but resets on every restart. Useful when
+   *   storage is disabled, or to compare live state vs. persisted view.
+   *
+   * Falls back to `bus` automatically when storage is unavailable
+   * (memory-only mode after a native-binding failure, etc).
+   */
+  private sendSessions(res: ServerResponse, url: URL): void {
+    const limit = clamp(parseIntOr(url.searchParams.get("limit"), 200), 1, 1000);
+    const since = parseIntOr(url.searchParams.get("since"), 0);
+    const requested = url.searchParams.get("source");
+    const source: "db" | "bus" =
+      requested === "bus" || !this.storage?.isReady() ? "bus" : "db";
+
+    if (source === "bus") {
+      const data = (this.extras?.sessions() ?? []) as unknown[];
+      return this.sendJson(res, 200, {
+        source: "bus",
+        count: data.length,
+        sessions: data,
+      });
+    }
+
+    const sessions = this.storage!.querySessions({ limit, sinceTs: since });
+    return this.sendJson(res, 200, {
+      source: "db",
+      count: sessions.length,
+      sessions,
+    });
   }
 
   private sendEvents(res: ServerResponse, url: URL): void {

@@ -2,7 +2,7 @@
   "id": "openclaw-observer",
   "name": "OpenClaw Observer",
   "description": "Real-time observability dashboard for agent runs, tool calls, model I/O, and diagnostic events",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "activation": {
     "onStartup": true
   },
