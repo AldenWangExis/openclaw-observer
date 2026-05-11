@@ -1,0 +1,89 @@
+{
+  "id": "openclaw-observer",
+  "name": "OpenClaw Observer",
+  "description": "Real-time observability dashboard for agent runs, tool calls, model I/O, and diagnostic events",
+  "version": "0.1.0",
+  "activation": {
+    "onStartup": true
+  },
+  "compat": {
+    "pluginApi": ">=2026.3.24-beta.2",
+    "minGatewayVersion": "2026.3.24-beta.2"
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Whether the observer plugin is active"
+      },
+      "port": {
+        "type": "number",
+        "default": 10010,
+        "minimum": 1024,
+        "maximum": 65535,
+        "description": "HTTP/WebSocket server port"
+      },
+      "bindHost": {
+        "type": "string",
+        "default": "127.0.0.1",
+        "description": "Bind address. Use 127.0.0.1 for loopback only, 0.0.0.0 for all interfaces"
+      },
+      "dbPath": {
+        "type": "string",
+        "default": "",
+        "description": "Absolute path to SQLite db. Empty = ./data/observer.db relative to plugin dir"
+      },
+      "retentionDays": {
+        "type": "number",
+        "default": 7,
+        "minimum": 1,
+        "maximum": 365,
+        "description": "How many days of events to keep in SQLite"
+      },
+      "bufferSize": {
+        "type": "number",
+        "default": 5000,
+        "minimum": 100,
+        "maximum": 100000,
+        "description": "In-memory ring buffer size for recent events"
+      },
+      "flushIntervalMs": {
+        "type": "number",
+        "default": 1000,
+        "minimum": 100,
+        "description": "How often (ms) to flush queued events to SQLite"
+      },
+      "flushBatchSize": {
+        "type": "number",
+        "default": 500,
+        "minimum": 1,
+        "description": "Force flush when queue reaches this size"
+      },
+      "captureContent": {
+        "type": "boolean",
+        "default": true,
+        "description": "Capture full content (prompts, tool params, results). Disable for metadata-only."
+      },
+      "redact": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Redact sensitive fields (api_key, token, secret, etc)"
+          },
+          "maxFieldBytes": {
+            "type": "number",
+            "default": 51200,
+            "minimum": 1024,
+            "description": "Max bytes per field; longer values are truncated"
+          }
+        }
+      }
+    }
+  }
+}

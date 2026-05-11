@@ -1,0 +1,68 @@
+{
+  "name": "openclaw-observer",
+  "version": "0.1.0",
+  "description": "Real-time observability dashboard for OpenClaw — see every prompt, tool call, token usage and diagnostic event live on http://127.0.0.1:10010",
+  "type": "module",
+  "main": "./dist/index.js",
+  "license": "MIT",
+  "author": "Libin Shen <shenlibin@nineanmedical.com>",
+  "homepage": "https://github.com/shenlibin/openclaw-observer#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shenlibin/openclaw-observer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shenlibin/openclaw-observer/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "observability",
+    "dashboard",
+    "tracing",
+    "agent",
+    "llm",
+    "tools"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "web/",
+    "openclaw.plugin.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "openclaw": {
+    "extensions": ["./src/index.ts"],
+    "runtimeExtensions": ["./dist/index.js"],
+    "compat": {
+      "pluginApi": ">=2026.3.24-beta.2",
+      "minGatewayVersion": "2026.3.24-beta.2"
+    },
+    "build": {
+      "openclawVersion": "2026.4.27",
+      "pluginSdkVersion": "2026.4.27"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "openclaw": "^2026.5.7",
+    "typescript": "^5.9.3"
+  }
+}

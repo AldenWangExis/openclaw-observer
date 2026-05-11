@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenClaw Observer</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ─────────── Header ─────────── -->
+  <header class="header">
+    <h1>🦞 OpenClaw Observer</h1>
+    <span class="badge"><span id="ws-dot" class="dot"></span><span id="ws-status">connecting…</span></span>
+    <div class="spacer"></div>
+    <button id="pause-btn">⏸ pause</button>
+    <button id="clear-btn">🗑 clear</button>
+    <input type="search" id="search" placeholder="/ search type, tool, model, payload…" />
+  </header>
+
+  <!-- ─────────── Main ─────────── -->
+  <div class="main">
+
+    <!-- LEFT: sessions tree -->
+    <aside class="col col-left">
+      <div class="col-header">
+        Sessions <span class="count" id="sessions-count">0</span>
+      </div>
+      <div class="col-body" id="sessions-list"></div>
+    </aside>
+
+    <!-- CENTER: toolbar + events -->
+    <section class="col col-center">
+      <div class="toolbar">
+        <span style="color:var(--muted); font-size:11px;">filter:</span>
+        <button id="cat-hook">hook</button>
+        <button id="cat-diag">diag</button>
+        <span class="sep"></span>
+        <button id="only-llm">🎯 LLM only</button>
+        <button id="only-tool">🔧 tools only</button>
+        <div class="spacer" style="flex:1"></div>
+        <span style="color:var(--muted); font-size:11px;">
+          <kbd style="background:var(--panel-3);padding:1px 5px;border:1px solid var(--border);border-radius:3px;">?</kbd>
+          help
+        </span>
+      </div>
+      <div class="col-body events-list" id="events-list"></div>
+    </section>
+
+    <!-- RIGHT: token panel + event detail -->
+    <aside class="col col-right" id="right-col">
+      <div id="token-panel" class="token-panel"></div>
+      <div class="col-header">
+        <span>Event detail</span>
+        <div class="spacer" style="flex:1"></div>
+        <button id="detail-copy" class="icon-btn" title="Copy JSON">⧉</button>
+        <button id="detail-wrap" class="icon-btn" title="Toggle wrap">↩</button>
+        <button id="detail-fullscreen" class="icon-btn" title="Fullscreen (F)">⛶</button>
+      </div>
+      <div class="col-body detail" id="detail">
+        <div class="detail-empty">Click an event to view its full payload</div>
+      </div>
+    </aside>
+
+  </div>
+
+  <!-- ─────────── Status bar ─────────── -->
+  <footer class="statusbar">
+    <span>db rows <b class="k" id="st-db-rows">–</b></span>
+    <span>total seq <b class="k" id="st-total-seq">–</b></span>
+    <span>buffered <b class="k" id="st-bus">–</b></span>
+    <span>flushed <b class="k" id="st-flushed">–</b></span>
+    <span>dropped <b class="k" id="st-dropped">–</b></span>
+    <span class="spacer"></span>
+    <span>events <b class="k" id="events-count">0</b></span>
+  </footer>
+
+</div>
+
+<!-- Help overlay -->
+<div id="help" class="help hidden">
+  <h4>Shortcuts</h4>
+  <dl>
+    <dt><kbd>/</kbd></dt><dd>focus search</dd>
+    <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>next / prev event</dd>
+    <dt><kbd>p</kbd></dt><dd>pause / resume live stream</dd>
+    <dt><kbd>c</kbd></dt><dd>clear event list</dd>
+    <dt><kbd>Esc</kbd></dt><dd>clear filter / close help</dd>
+    <dt><kbd>?</kbd></dt><dd>toggle this panel</dd>
+    <dt><kbd>F</kbd></dt><dd>fullscreen the event detail pane</dd>
+  </dl>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Build output (regenerated via `npm run build`; shipped only in npm tarball)
+dist/
+
+# Runtime state (SQLite WAL/DB created at first run)
+data/
+
+# Local packaging artifacts
+*.tgz
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
