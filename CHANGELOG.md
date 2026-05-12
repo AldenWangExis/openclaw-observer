@@ -5,6 +5,14 @@ All notable changes to this plugin will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0-alpha.1] — 2026-05-12
+
+Schema groundwork release for user-centric analytics. Adds SQLite-native
+versioned migrations (`PRAGMA user_version`) and starts persisting `open_id`
+plus `sender_name` on events. `open_id` is sourced from
+`message_received.metadata.senderId` when present, with direct-message
+`session_key` parsing as fallback so DM events can be correlated by user.
+
 ## [0.5.0] — 2026-05-12
 
 Reliability hardening release. Fixes redaction correctness, bounds the

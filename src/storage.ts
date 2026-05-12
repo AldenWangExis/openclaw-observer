@@ -17,6 +17,7 @@ import type { Database as SqliteDatabase, Statement } from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { runMigrations } from "./migrations.js";
 import type { ObserverEvent, SessionState, SessionStatus } from "./types.js";
 import { safeStringify } from "./util.js";
 
@@ -125,6 +126,7 @@ export class Storage {
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA_SQL);
+    runMigrations(this.db, this.logger);
 
     this.insertStmt = this.db.prepare(`
       INSERT OR IGNORE INTO events (
@@ -134,6 +136,7 @@ export class Storage {
         tool_name, tool_call_id, tool_status,
         provider, model, duration_ms,
         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_total,
+        open_id, sender_name,
         payload
       ) VALUES (
         @id, @ts, @seq, @category, @type,
@@ -142,6 +145,7 @@ export class Storage {
         @tool_name, @tool_call_id, @tool_status,
         @provider, @model, @duration_ms,
         @tokens_input, @tokens_output, @tokens_cache_read, @tokens_cache_write, @tokens_total,
+        @open_id, @sender_name,
         @payload
       )
     `);
@@ -639,6 +643,8 @@ interface Row {
   tokens_cache_read: number | null;
   tokens_cache_write: number | null;
   tokens_total: number | null;
+  open_id: string | null;
+  sender_name: string | null;
   payload: string;
 }
 
@@ -667,6 +673,8 @@ function toRow(e: ObserverEvent): Row {
     tokens_cache_read: e.tokens?.cacheRead ?? null,
     tokens_cache_write: e.tokens?.cacheWrite ?? null,
     tokens_total: e.tokens?.total ?? null,
+    open_id: e.openId ?? null,
+    sender_name: e.senderName ?? null,
     payload: safeStringify(e.payload),
   };
 }
@@ -823,6 +831,8 @@ export function rowToEvent(r: DbEventRow): ObserverEvent {
   if (r.provider) evt.provider = r.provider;
   if (r.model) evt.model = r.model;
   if (r.duration_ms != null) evt.durationMs = r.duration_ms;
+  if (r.open_id) evt.openId = r.open_id;
+  if (r.sender_name) evt.senderName = r.sender_name;
   if (Object.keys(tokens).length) evt.tokens = tokens;
   return evt;
 }

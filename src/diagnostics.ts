@@ -12,7 +12,7 @@
 
 import type { EventBus } from "./event-bus.js";
 import type { ObserverEvent, ObserverTokens } from "./types.js";
-import { now, pickNumber, pickObject, pickString } from "./util.js";
+import { now, parseOpenIdFromDmSessionKey, pickNumber, pickObject, pickString } from "./util.js";
 
 /** Unsubscribe function returned by the runtime. */
 export type DiagnosticUnsubscribe = () => void;
@@ -89,17 +89,19 @@ function normalizeDiag(raw: unknown): Omit<ObserverEvent, "id" | "seq"> | null {
 
   const trace = pickObject(src, "trace");
   const usage = pickObject(src, "usage");
+  const sessionKey = pickString(src, "sessionKey");
 
   return {
     ts: pickNumber(src, "ts") ?? now(),
     category: "diag",
     type,
     runId: pickString(src, "runId"),
-    sessionKey: pickString(src, "sessionKey"),
+    sessionKey,
     sessionId: pickString(src, "sessionId"),
     agentId: pickString(src, "agentId"),
     channel: pickString(src, "channel"),
     traceId: pickString(trace, "traceId"),
+    openId: pickString(src, "openId") ?? parseOpenIdFromDmSessionKey(sessionKey),
     provider: pickString(src, "provider"),
     model: pickString(src, "model"),
     toolName: pickString(src, "toolName"),

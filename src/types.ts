@@ -41,6 +41,8 @@ export interface ObserverEvent {
   agentId?: string;
   channel?: string;
   traceId?: string;
+  openId?: string;
+  senderName?: string;
   /** For subagent_spawning: the parent session that spawned the child. */
   parentSessionKey?: string;
 

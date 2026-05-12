@@ -75,3 +75,13 @@ export function pickObject(
     ? (v as Record<string, unknown>)
     : undefined;
 }
+
+/**
+ * Parse open_id from direct-message session key:
+ *   agent:<agent>:<channel>:direct:ou_xxx
+ */
+export function parseOpenIdFromDmSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return undefined;
+  const m = sessionKey.match(/^agent:[^:]+:[^:]+:direct:(ou_[A-Za-z0-9]+)$/);
+  return m?.[1];
+}
