@@ -41,6 +41,35 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 2,
+    name: "add_group_alias_table",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS group_alias (
+          chat_id     TEXT PRIMARY KEY,
+          group_name  TEXT,
+          source      TEXT NOT NULL DEFAULT 'derived:session_key',
+          updated_at  INTEGER NOT NULL
+        );
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_group_alias_updated_at ON group_alias(updated_at);`);
+
+      // Backfill group chat_id from historical session keys so dashboard and APIs
+      // can immediately resolve group sessions to a stable identifier.
+      db.exec(`
+        INSERT OR IGNORE INTO group_alias (chat_id, group_name, source, updated_at)
+        SELECT DISTINCT
+          SUBSTR(session_key, INSTR(session_key, ':group:') + 7) AS chat_id,
+          SUBSTR(session_key, INSTR(session_key, ':group:') + 7) AS group_name,
+          'derived:session_key' AS source,
+          CAST(strftime('%s', 'now') AS INTEGER) * 1000 AS updated_at
+        FROM events
+        WHERE session_key GLOB 'agent:*:group:oc_*'
+          AND INSTR(session_key, ':group:') > 0;
+      `);
+    },
+  },
 ];
 
 export function runMigrations(db: SqliteDatabase, logger: MigrationLogger): void {
