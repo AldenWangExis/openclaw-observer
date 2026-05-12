@@ -211,6 +211,7 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const els = {
+  main: document.querySelector(".main"),
   sessionsList: $("sessions-list"),
   sessionsCount: $("sessions-count"),
   eventsList: $("events-list"),
@@ -236,6 +237,8 @@ const els = {
   detailCopy: $("detail-copy"),
   detailWrap: $("detail-wrap"),
   detailFullscreen: $("detail-fullscreen"),
+  resizeLeft: $("resize-left"),
+  resizeRight: $("resize-right"),
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -367,6 +370,17 @@ function fmtTs(ms) {
   const ss = String(d.getSeconds()).padStart(2, "0");
   const ms3 = String(d.getMilliseconds()).padStart(3, "0");
   return `${hh}:${mm}:${ss}.${ms3}`;
+}
+
+function fmtUtc8Seconds(ms) {
+  const d = new Date(ms + 8 * 60 * 60 * 1000);
+  const yyyy = d.getUTCFullYear();
+  const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+  return `${yyyy}-${mo}-${dd} ${hh}:${mm}:${ss} UTC+8`;
 }
 
 function shortKey(s, n = 40) {
@@ -509,7 +523,7 @@ function renderDetail() {
   // ── Meta table (collapsible detail list) ─────────────────────
   const metaRows = [];
   const push = (k, v) => v != null && v !== "" && metaRows.push(`<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`);
-  push("time", new Date(e.ts).toISOString());
+  push("time", fmtUtc8Seconds(e.ts));
   push("seq", e.seq);
   push("category", e.category);
   push("type", e.type);
@@ -846,12 +860,16 @@ els.catDiagBtn.addEventListener("click", () => {
   renderEvents();
 });
 els.llmBtn.addEventListener("click", () => {
-  state.filters.onlyLlm = !state.filters.onlyLlm;
+  const next = !state.filters.onlyLlm;
+  state.filters.onlyLlm = next;
+  if (next) state.filters.onlyTools = false;
   paintFilterButtons();
   renderEvents();
 });
 els.toolBtn.addEventListener("click", () => {
-  state.filters.onlyTools = !state.filters.onlyTools;
+  const next = !state.filters.onlyTools;
+  state.filters.onlyTools = next;
+  if (next) state.filters.onlyLlm = false;
   paintFilterButtons();
   renderEvents();
 });
@@ -882,6 +900,113 @@ if (els.detailWrap) {
     renderDetail();
   });
   els.detailWrap.classList.toggle("on", state.detailWrap);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Resizable side panels
+
+const PANEL_WIDTH_KEY = "openclaw-observer:panel-widths";
+const PANEL_MIN = { left: 180, right: 300, center: 360 };
+const PANEL_MAX = { left: 640, right: 820 };
+const PANEL_DEFAULT = { left: 280, right: 420 };
+const HANDLE_TOTAL_WIDTH = 12;
+
+function initResizablePanels() {
+  applyStoredPanelWidths();
+  bindPanelResize(els.resizeLeft, "left");
+  bindPanelResize(els.resizeRight, "right");
+}
+
+function applyStoredPanelWidths() {
+  const widths = readStoredPanelWidths();
+  applyPanelWidths(widths);
+}
+
+function readStoredPanelWidths() {
+  try {
+    const raw = localStorage.getItem(PANEL_WIDTH_KEY);
+    if (!raw) return { ...PANEL_DEFAULT };
+    const parsed = JSON.parse(raw);
+    return {
+      left: Number.isFinite(parsed.left) ? parsed.left : PANEL_DEFAULT.left,
+      right: Number.isFinite(parsed.right) ? parsed.right : PANEL_DEFAULT.right,
+    };
+  } catch {
+    return { ...PANEL_DEFAULT };
+  }
+}
+
+function writeStoredPanelWidths(widths) {
+  try {
+    localStorage.setItem(PANEL_WIDTH_KEY, JSON.stringify(widths));
+  } catch {
+    /* ignore storage failures */
+  }
+}
+
+function applyPanelWidths(widths) {
+  if (!els.main) return;
+  els.main.style.setProperty("--left-panel-w", `${Math.round(widths.left)}px`);
+  els.main.style.setProperty("--right-panel-w", `${Math.round(widths.right)}px`);
+}
+
+function bindPanelResize(handle, side) {
+  if (!handle || !els.main) return;
+  handle.addEventListener("pointerdown", (ev) => {
+    ev.preventDefault();
+    handle.setPointerCapture?.(ev.pointerId);
+    handle.classList.add("dragging");
+    document.body.classList.add("resizing");
+
+    const onMove = (moveEv) => {
+      const rect = els.main.getBoundingClientRect();
+      const current = readCurrentPanelWidths();
+      let next = current;
+      if (side === "left") {
+        const maxLeft = rect.width - current.right - PANEL_MIN.center - HANDLE_TOTAL_WIDTH;
+        next = {
+          ...current,
+          left: clamp(moveEv.clientX - rect.left, PANEL_MIN.left, Math.min(PANEL_MAX.left, maxLeft)),
+        };
+      } else {
+        const maxRight = rect.width - current.left - PANEL_MIN.center - HANDLE_TOTAL_WIDTH;
+        next = {
+          ...current,
+          right: clamp(rect.right - moveEv.clientX, PANEL_MIN.right, Math.min(PANEL_MAX.right, maxRight)),
+        };
+      }
+      applyPanelWidths(next);
+      writeStoredPanelWidths(next);
+    };
+
+    const stop = () => {
+      handle.classList.remove("dragging");
+      document.body.classList.remove("resizing");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", stop, { once: true });
+    window.addEventListener("pointercancel", stop, { once: true });
+  });
+}
+
+function readCurrentPanelWidths() {
+  const computed = els.main ? getComputedStyle(els.main) : null;
+  const left = parseCssPx(computed?.getPropertyValue("--left-panel-w"), PANEL_DEFAULT.left);
+  const right = parseCssPx(computed?.getPropertyValue("--right-panel-w"), PANEL_DEFAULT.right);
+  return { left, right };
+}
+
+function parseCssPx(value, fallback) {
+  const n = parseFloat(String(value || "").replace("px", ""));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(n, lo, hi) {
+  return Math.max(lo, Math.min(hi, n));
 }
 
 function toggleDetailFullscreen() {
@@ -992,6 +1117,7 @@ async function pollAux() {
 // Bootstrap
 
 function boot() {
+  initResizablePanels();
   paintConnection();
   paintFilterButtons();
   renderEvents();
