@@ -96,13 +96,45 @@ input[type="search"]:focus { outline: none; border-color: var(--accent); }
 /* ─────────────── main 3-column ─────────────── */
 .main {
   display: grid;
-  grid-template-columns: 280px 1fr 420px;
+  grid-template-columns:
+    var(--left-panel-w, 280px)
+    6px
+    minmax(360px, 1fr)
+    6px
+    var(--right-panel-w, 420px);
   min-height: 0;
 }
 .col { min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 .col-left   { border-right: 1px solid var(--border); background: var(--panel); }
 .col-center { background: var(--bg); }
 .col-right  { border-left:  1px solid var(--border); background: var(--panel); }
+.resize-handle {
+  min-height: 0;
+  cursor: col-resize;
+  background: var(--bg);
+  border-left: 1px solid transparent;
+  border-right: 1px solid transparent;
+  position: relative;
+  z-index: 3;
+}
+.resize-handle:hover,
+.resize-handle.dragging {
+  background: rgba(88, 166, 255, 0.12);
+  border-color: var(--accent);
+}
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 1px;
+  background: var(--border);
+}
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
 
 .col-header {
   padding: 8px 12px;
@@ -366,7 +398,8 @@ body.detail-fullscreen .d-raw { max-height: none; }
 
 /* ─────────────── fullscreen the right column ─────────────────── */
 body.detail-fullscreen .col-left,
-body.detail-fullscreen .col-center { display: none; }
+body.detail-fullscreen .col-center,
+body.detail-fullscreen .resize-handle { display: none; }
 body.detail-fullscreen .main { grid-template-columns: 1fr; }
 body.detail-fullscreen #right-col { border-left: none; }
 body.detail-fullscreen .detail { padding: 20px 40px; max-width: 1200px; margin: 0 auto; }
