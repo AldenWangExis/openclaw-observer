@@ -86,6 +86,15 @@ export interface StorageStats {
   lastFlushError?: string;
 }
 
+export interface KnownUser {
+  openId: string;
+  senderName?: string;
+  firstSeen: number;
+  lastSeen: number;
+  messageCount: number;
+  sessionCount: number;
+}
+
 export class Storage {
   private db: SqliteDatabase | null = null;
   private insertStmt: Statement | null = null;
@@ -312,6 +321,7 @@ export class Storage {
     sinceTs?: number;
     afterSeq?: number;
     session?: string;
+    openId?: string;
     type?: string;
     category?: string;
   } = {}): ObserverEvent[] {
@@ -330,6 +340,10 @@ export class Storage {
     if (opts.session) {
       wheres.push("session_key = ?");
       params.push(opts.session);
+    }
+    if (opts.openId) {
+      wheres.push("open_id = ?");
+      params.push(opts.openId);
     }
     if (opts.type) {
       wheres.push("type = ?");
@@ -373,7 +387,7 @@ export class Storage {
    *  - `total`: prefer `tokens_total` if non-NULL, else `input + output`,
    *    matching `addInto()`.
    */
-  queryTokens(opts: { sinceTs?: number } = {}): TokenSnapshot {
+  queryTokens(opts: { sinceTs?: number; openId?: string } = {}): TokenSnapshot {
     if (!this.ready || !this.db) return emptyTokenSnapshot();
     const sinceTs = opts.sinceTs && opts.sinceTs > 0 ? opts.sinceTs : 0;
     const now = Date.now();
@@ -391,36 +405,42 @@ export class Storage {
       COALESCE(SUM(COALESCE(tokens_total, COALESCE(tokens_input,0) + COALESCE(tokens_output,0))), 0) AS t_tot,
       COUNT(*) AS calls
     `;
-    const BASE_WHERE = `
-      WHERE type = 'llm_output'
-        AND ts >= ?
-        AND (tokens_input IS NOT NULL OR tokens_output IS NOT NULL OR tokens_total IS NOT NULL)
-    `;
+    const whereParts = [
+      "type = 'llm_output'",
+      "ts >= ?",
+      "(tokens_input IS NOT NULL OR tokens_output IS NOT NULL OR tokens_total IS NOT NULL)",
+    ];
+    const baseParams: unknown[] = [sinceTs];
+    if (opts.openId) {
+      whereParts.push("open_id = ?");
+      baseParams.push(opts.openId);
+    }
+    const BASE_WHERE = `WHERE ${whereParts.join(" AND ")}`;
 
     try {
       const overallRow = this.db
         .prepare(`SELECT ${SUM_EXPR} FROM events ${BASE_WHERE}`)
-        .get(sinceTs) as TokenAggRow | undefined;
+        .get(...baseParams) as TokenAggRow | undefined;
 
       const hourRow = this.db
         .prepare(`SELECT ${SUM_EXPR} FROM events ${BASE_WHERE} AND ts >= ?`)
-        .get(sinceTs, hourCutoff) as TokenAggRow | undefined;
+        .get(...baseParams, hourCutoff) as TokenAggRow | undefined;
 
       const dayRow = this.db
         .prepare(`SELECT ${SUM_EXPR} FROM events ${BASE_WHERE} AND ts >= ?`)
-        .get(sinceTs, dayCutoff) as TokenAggRow | undefined;
+        .get(...baseParams, dayCutoff) as TokenAggRow | undefined;
 
       const sessionRows = this.db
         .prepare(
           `SELECT session_key AS k, ${SUM_EXPR} FROM events ${BASE_WHERE} AND session_key IS NOT NULL GROUP BY session_key`,
         )
-        .all(sinceTs) as TokenAggKeyedRow[];
+        .all(...baseParams) as TokenAggKeyedRow[];
 
       const agentRows = this.db
         .prepare(
           `SELECT agent_id AS k, ${SUM_EXPR} FROM events ${BASE_WHERE} AND agent_id IS NOT NULL GROUP BY agent_id`,
         )
-        .all(sinceTs) as TokenAggKeyedRow[];
+        .all(...baseParams) as TokenAggKeyedRow[];
 
       // Model key is "provider/model" (or just one of them) — match the
       // in-memory `formatModelKey()` exactly.
@@ -436,7 +456,7 @@ export class Storage {
            FROM events ${BASE_WHERE} AND (provider IS NOT NULL OR model IS NOT NULL)
            GROUP BY k`,
         )
-        .all(sinceTs) as TokenAggKeyedRow[];
+        .all(...baseParams) as TokenAggKeyedRow[];
 
       return {
         overall: rowToBucket(overallRow),
@@ -484,10 +504,11 @@ export class Storage {
    * Returns [] if storage is not ready (memory-only fallback) — caller
    * should then fall back to the in-memory tracker.
    */
-  querySessions(opts: { limit?: number; sinceTs?: number } = {}): SessionState[] {
+  querySessions(opts: { limit?: number; sinceTs?: number; openId?: string } = {}): SessionState[] {
     if (!this.ready || !this.db) return [];
     const limit = clampInt(opts.limit, 1, 1000, 200);
     const sinceTs = opts.sinceTs && opts.sinceTs > 0 ? opts.sinceTs : 0;
+    const openId = opts.openId && opts.openId.trim().length > 0 ? opts.openId.trim() : undefined;
 
     // Type IDs that the tracker reads. Keep these in sync with the
     // STATUS_FROM_HOOK / currentAction logic in session-tracker.ts.
@@ -514,6 +535,9 @@ export class Storage {
     // Build IN (?, ?, …) placeholders so prepared-statement caching still works.
     const statusPlaceholders = STATUS_TYPES.map(() => "?").join(",");
     const actionPlaceholders = ACTION_TYPES.map(() => "?").join(",");
+    const openIdFilter = openId
+      ? `AND session_key IN (SELECT DISTINCT session_key FROM events WHERE open_id = ?)`
+      : "";
 
     const sql = `
       WITH base AS (
@@ -531,7 +555,7 @@ export class Storage {
           MIN(agent_id) AS agent_id,
           MIN(channel) AS channel
         FROM events
-        WHERE session_key IS NOT NULL AND ts >= ?
+        WHERE session_key IS NOT NULL AND ts >= ? ${openIdFilter}
         GROUP BY session_key
       ),
       last_status AS (
@@ -578,20 +602,64 @@ export class Storage {
     `;
 
     try {
+      const args: unknown[] = [
+        sinceTs,
+        ...(openId ? [openId] : []),
+        ...STATUS_TYPES,
+        sinceTs,
+        ...ACTION_TYPES,
+        sinceTs,
+        sinceTs,
+        limit,
+      ];
       const rows = this.db
         .prepare(sql)
-        .all(
-          sinceTs,
-          ...STATUS_TYPES,
-          sinceTs,
-          ...ACTION_TYPES,
-          sinceTs,
-          sinceTs,
-          limit,
-        ) as SessionRow[];
+        .all(...args) as SessionRow[];
       return rows.map(rowToSessionState);
     } catch (err) {
       this.logger.warn(`[observer] querySessions failed: ${errMsg(err)}`);
+      return [];
+    }
+  }
+
+  listKnownUsers(opts: { limit?: number } = {}): KnownUser[] {
+    if (!this.ready || !this.db) return [];
+    const limit = clampInt(opts.limit, 1, 1000, 200);
+    const sql = `
+      WITH latest_name AS (
+        SELECT
+          open_id,
+          sender_name,
+          ROW_NUMBER() OVER (PARTITION BY open_id ORDER BY ts DESC, seq DESC) AS rn
+        FROM events
+        WHERE open_id IS NOT NULL AND sender_name IS NOT NULL
+      )
+      SELECT
+        e.open_id AS open_id,
+        ln.sender_name AS sender_name,
+        MIN(e.ts) AS first_seen,
+        MAX(e.ts) AS last_seen,
+        SUM(CASE WHEN e.type = 'message_received' THEN 1 ELSE 0 END) AS message_count,
+        COUNT(DISTINCT e.session_key) AS session_count
+      FROM events e
+      LEFT JOIN latest_name ln ON ln.open_id = e.open_id AND ln.rn = 1
+      WHERE e.open_id IS NOT NULL
+      GROUP BY e.open_id, ln.sender_name
+      ORDER BY last_seen DESC
+      LIMIT ?
+    `;
+    try {
+      const rows = this.db.prepare(sql).all(limit) as KnownUserRow[];
+      return rows.map((r) => ({
+        openId: r.open_id,
+        senderName: r.sender_name ?? undefined,
+        firstSeen: r.first_seen,
+        lastSeen: r.last_seen,
+        messageCount: r.message_count,
+        sessionCount: r.session_count,
+      }));
+    } catch (err) {
+      this.logger.warn(`[observer] listKnownUsers failed: ${errMsg(err)}`);
       return [];
     }
   }
@@ -876,6 +944,15 @@ interface TokenAggRow {
 
 interface TokenAggKeyedRow extends TokenAggRow {
   k: string;
+}
+
+interface KnownUserRow {
+  open_id: string;
+  sender_name: string | null;
+  first_seen: number;
+  last_seen: number;
+  message_count: number;
+  session_count: number;
 }
 
 function emptyBucket(): TokenBucket {

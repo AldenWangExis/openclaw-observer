@@ -148,6 +148,9 @@ export class ObserverHttpServer {
     if (url.pathname === "/api/tokens") {
       return this.sendTokens(res, url);
     }
+    if (url.pathname === "/api/users") {
+      return this.sendUsers(res, url);
+    }
     if (url.pathname === "/api/events") {
       return this.sendEvents(res, url);
     }
@@ -242,6 +245,7 @@ export class ObserverHttpServer {
   private sendSessions(res: ServerResponse, url: URL): void {
     const limit = clamp(parseIntOr(url.searchParams.get("limit"), 200), 1, 1000);
     const since = parseIntOr(url.searchParams.get("since"), 0);
+    const openId = url.searchParams.get("openId") ?? undefined;
     const requested = url.searchParams.get("source");
     const source: "db" | "bus" =
       requested === "bus" || !this.storage?.isReady() ? "bus" : "db";
@@ -255,7 +259,7 @@ export class ObserverHttpServer {
       });
     }
 
-    const sessions = this.storage!.querySessions({ limit, sinceTs: since });
+    const sessions = this.storage!.querySessions({ limit, sinceTs: since, openId });
     return this.sendJson(res, 200, {
       source: "db",
       count: sessions.length,
@@ -279,6 +283,7 @@ export class ObserverHttpServer {
   private sendEvents(res: ServerResponse, url: URL): void {
     const limit = clamp(parseIntOr(url.searchParams.get("limit"), 200), 1, 5000);
     const session = url.searchParams.get("session") ?? undefined;
+    const openId = url.searchParams.get("openId") ?? undefined;
     const type = url.searchParams.get("type") ?? undefined;
     const category = url.searchParams.get("category") ?? undefined;
     const since = parseIntOr(url.searchParams.get("since"), 0);
@@ -290,17 +295,25 @@ export class ObserverHttpServer {
     // Determine which backing store to use
     const useDb =
       requested === "db" ||
-      (requested !== "bus" && storageReady && (!busWarm || session || type || since > 0));
+      (requested !== "bus" && storageReady && (!busWarm || session || openId || type || since > 0));
 
     if (!useDb || !this.storage) {
       let events = this.bus.recent(limit);
       if (type) events = events.filter((e) => e.type === type);
       if (category) events = events.filter((e) => e.category === category);
       if (session) events = events.filter((e) => e.sessionKey === session);
+      if (openId) events = events.filter((e) => e.openId === openId);
       return this.sendJson(res, 200, { source: "bus", count: events.length, events });
     }
 
-    const events = this.storage.queryRecentEvents({ limit, sinceTs: since, session, type, category });
+    const events = this.storage.queryRecentEvents({
+      limit,
+      sinceTs: since,
+      session,
+      openId,
+      type,
+      category,
+    });
     this.sendJson(res, 200, { source: "db", count: events.length, events });
   }
 
@@ -318,6 +331,7 @@ export class ObserverHttpServer {
   private sendTokens(res: ServerResponse, url: URL): void {
     const requested = url.searchParams.get("source");
     const since = parseIntOr(url.searchParams.get("since"), 0);
+    const openId = url.searchParams.get("openId") ?? undefined;
     const storageReady = this.storage?.isReady() ?? false;
 
     const useDb = requested !== "bus" && storageReady;
@@ -327,7 +341,7 @@ export class ObserverHttpServer {
       delete data["lastHour"];
       delete data["lastDay"];
       if (this.storage?.isReady()) {
-        const windows = this.storage.queryTokens({ sinceTs: since });
+        const windows = this.storage.queryTokens({ sinceTs: since, openId });
         data["lastHour"] = windows.lastHour;
         data["lastDay"] = windows.lastDay;
         data["windowsSource"] = "db";
@@ -335,8 +349,17 @@ export class ObserverHttpServer {
       return this.sendJson(res, 200, { source: "bus", ...data });
     }
 
-    const data = this.storage!.queryTokens({ sinceTs: since });
+    const data = this.storage!.queryTokens({ sinceTs: since, openId });
     this.sendJson(res, 200, { source: "db", ...data });
+  }
+
+  private sendUsers(res: ServerResponse, url: URL): void {
+    const limit = clamp(parseIntOr(url.searchParams.get("limit"), 200), 1, 1000);
+    if (!this.storage?.isReady()) {
+      return this.sendJson(res, 200, { source: "bus", count: 0, users: [] });
+    }
+    const users = this.storage.listKnownUsers({ limit });
+    return this.sendJson(res, 200, { source: "db", count: users.length, users });
   }
 
   // ────────────────────────────────────────────────────────────────────
