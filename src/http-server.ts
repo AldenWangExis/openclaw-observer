@@ -45,7 +45,7 @@ export interface HttpExtras {
 }
 
 /** How many backlog events to push to a new websocket client. */
-const WS_INITIAL_BACKLOG = 200;
+const WS_INITIAL_BACKLOG = 2000;
 
 export class ObserverHttpServer {
   private server: Server | null = null;
@@ -345,23 +345,27 @@ export class ObserverHttpServer {
 
   private onWsClient(socket: WebSocket, req: IncomingMessage): void {
     try {
-      // Prefer in-memory ring; fall back to DB when the bus is empty
-      // (e.g. immediately after a gateway restart before any new events).
       const url = new URL(req.url ?? "/ws", "http://localhost");
+      const requested = url.searchParams.get("source");
       const sinceSeq = parseIntOr(url.searchParams.get("sinceSeq"), 0);
       const sinceTs = parseIntOr(url.searchParams.get("sinceTs"), 0);
-      let backlog =
+      const busBacklog =
         sinceSeq > 0
           ? this.bus.recent(WS_INITIAL_BACKLOG).filter((e) => e.seq > sinceSeq)
           : this.bus.recent(WS_INITIAL_BACKLOG);
+      let backlog = busBacklog;
       let backlogSource: "bus" | "db" = "bus";
-      if ((backlog.length < BUS_WARM_THRESHOLD || sinceTs > 0) && this.storage?.isReady()) {
+
+      // Default to persisted history whenever storage is available. The bus
+      // is still merged in to cover events not flushed yet, and remains an
+      // explicit debug/fallback source via /ws?source=bus or memory-only mode.
+      if (requested !== "bus" && this.storage?.isReady()) {
         const dbBacklog = this.storage.queryRecentEvents({
           limit: WS_INITIAL_BACKLOG,
           sinceTs: sinceTs > 0 ? sinceTs : undefined,
           afterSeq: sinceTs > 0 ? undefined : sinceSeq,
         });
-        backlog = mergeEventsNewestLast(dbBacklog, backlog).slice(-WS_INITIAL_BACKLOG);
+        backlog = mergeEventsNewestLast(dbBacklog, busBacklog).slice(-WS_INITIAL_BACKLOG);
         backlogSource = "db";
       }
       socket.send(safeStringify({ type: "backlog", source: backlogSource, events: backlog }));
