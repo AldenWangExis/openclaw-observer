@@ -9,6 +9,7 @@
  *   GET  /app.js|style.css   →  same folder
  *   GET  /api/stats          →  { bus, storage }
  *   GET  /api/events         →  query recent events (see params)
+ *   GET  /api/groups         →  known group aliases from SQLite
  *   GET  /ws                 →  websocket; initial backlog + live stream
  *
  * All handlers wrap in try/catch; errors emit 500 without leaking stacks.
@@ -150,6 +151,9 @@ export class ObserverHttpServer {
     }
     if (url.pathname === "/api/users") {
       return this.sendUsers(res, url);
+    }
+    if (url.pathname === "/api/groups") {
+      return this.sendGroups(res, url);
     }
     if (url.pathname === "/api/events") {
       return this.sendEvents(res, url);
@@ -360,6 +364,15 @@ export class ObserverHttpServer {
     }
     const users = this.storage.listKnownUsers({ limit });
     return this.sendJson(res, 200, { source: "db", count: users.length, users });
+  }
+
+  private sendGroups(res: ServerResponse, url: URL): void {
+    const limit = clamp(parseIntOr(url.searchParams.get("limit"), 200), 1, 1000);
+    if (!this.storage?.isReady()) {
+      return this.sendJson(res, 200, { source: "bus", count: 0, groups: [] });
+    }
+    const groups = this.storage.listKnownGroups({ limit });
+    return this.sendJson(res, 200, { source: "db", count: groups.length, groups });
   }
 
   // ────────────────────────────────────────────────────────────────────

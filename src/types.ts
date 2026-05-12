@@ -78,6 +78,8 @@ export interface SessionState {
   parentSessionKey?: string;
   agentId?: string;
   channel?: string;
+  groupChatId?: string;
+  groupName?: string;
   firstSeen: number;
   lastSeen: number;
   status: SessionStatus;

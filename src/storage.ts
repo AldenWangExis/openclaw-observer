@@ -19,7 +19,7 @@ import { dirname } from "node:path";
 
 import { runMigrations } from "./migrations.js";
 import type { ObserverEvent, SessionState, SessionStatus } from "./types.js";
-import { safeStringify } from "./util.js";
+import { parseGroupChatIdFromSessionKey, safeStringify } from "./util.js";
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS events (
@@ -93,6 +93,13 @@ export interface KnownUser {
   lastSeen: number;
   messageCount: number;
   sessionCount: number;
+}
+
+export interface KnownGroup {
+  chatId: string;
+  groupName: string;
+  source: string;
+  updatedAt: number;
 }
 
 export class Storage {
@@ -553,7 +560,12 @@ export class Storage {
           COALESCE(SUM(tokens_total), 0) AS t_tot,
           MIN(parent_session_key) AS parent_session_key,
           MIN(agent_id) AS agent_id,
-          MIN(channel) AS channel
+          MIN(channel) AS channel,
+          CASE
+            WHEN session_key GLOB 'agent:*:group:oc_*' AND INSTR(session_key, ':group:') > 0
+              THEN SUBSTR(session_key, INSTR(session_key, ':group:') + 7)
+            ELSE NULL
+          END AS group_chat_id
         FROM events
         WHERE session_key IS NOT NULL AND ts >= ? ${openIdFilter}
         GROUP BY session_key
@@ -587,6 +599,7 @@ export class Storage {
         base.first_seen, base.last_seen, base.event_count,
         base.t_in, base.t_out, base.t_cr, base.t_cw, base.t_tot,
         base.parent_session_key, base.agent_id, base.channel,
+        base.group_chat_id, ga.group_name,
         last_status.type   AS status_type,
         last_action.type   AS action_type,
         last_action.ts     AS action_ts,
@@ -594,6 +607,7 @@ export class Storage {
         last_action.model     AS action_model,
         first_msg.payload AS first_msg_payload
       FROM base
+      LEFT JOIN group_alias ga ON ga.chat_id = base.group_chat_id
       LEFT JOIN last_status ON last_status.session_key = base.session_key
       LEFT JOIN last_action ON last_action.session_key = base.session_key
       LEFT JOIN first_msg   ON first_msg.session_key   = base.session_key
@@ -618,6 +632,33 @@ export class Storage {
       return rows.map(rowToSessionState);
     } catch (err) {
       this.logger.warn(`[observer] querySessions failed: ${errMsg(err)}`);
+      return [];
+    }
+  }
+
+  listKnownGroups(opts: { limit?: number } = {}): KnownGroup[] {
+    if (!this.ready || !this.db) return [];
+    const limit = clampInt(opts.limit, 1, 1000, 200);
+    const sql = `
+      SELECT
+        chat_id AS chat_id,
+        COALESCE(group_name, chat_id) AS group_name,
+        source AS source,
+        updated_at AS updated_at
+      FROM group_alias
+      ORDER BY updated_at DESC, chat_id ASC
+      LIMIT ?
+    `;
+    try {
+      const rows = this.db.prepare(sql).all(limit) as KnownGroupRow[];
+      return rows.map((r) => ({
+        chatId: r.chat_id,
+        groupName: r.group_name,
+        source: r.source,
+        updatedAt: r.updated_at,
+      }));
+    } catch (err) {
+      this.logger.warn(`[observer] listKnownGroups failed: ${errMsg(err)}`);
       return [];
     }
   }
@@ -768,6 +809,8 @@ interface SessionRow {
   parent_session_key: string | null;
   agent_id: string | null;
   channel: string | null;
+  group_chat_id: string | null;
+  group_name: string | null;
   status_type: string | null;
   action_type: string | null;
   action_ts: number | null;
@@ -808,6 +851,9 @@ function rowToSessionState(r: SessionRow): SessionState {
   if (r.parent_session_key) state.parentSessionKey = r.parent_session_key;
   if (r.agent_id) state.agentId = r.agent_id;
   if (r.channel) state.channel = r.channel;
+  const groupChatId = r.group_chat_id ?? parseGroupChatIdFromSessionKey(r.session_key);
+  if (groupChatId) state.groupChatId = groupChatId;
+  if (r.group_name && r.group_name.trim().length > 0) state.groupName = r.group_name;
 
   // currentAction / currentActionStart: replay the action_type's effect
   // exactly like session-tracker.ts does in `apply()`.
@@ -953,6 +999,13 @@ interface KnownUserRow {
   last_seen: number;
   message_count: number;
   session_count: number;
+}
+
+interface KnownGroupRow {
+  chat_id: string;
+  group_name: string;
+  source: string;
+  updated_at: number;
 }
 
 function emptyBucket(): TokenBucket {
