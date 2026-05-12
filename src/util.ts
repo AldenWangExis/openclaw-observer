@@ -75,3 +75,23 @@ export function pickObject(
     ? (v as Record<string, unknown>)
     : undefined;
 }
+
+/**
+ * Parse open_id from direct-message session key:
+ *   agent:<agent>:<channel>:direct:ou_xxx
+ */
+export function parseOpenIdFromDmSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return undefined;
+  const m = sessionKey.match(/^agent:[^:]+:[^:]+:direct:(ou_[A-Za-z0-9]+)$/);
+  return m?.[1];
+}
+
+/**
+ * Parse group chat_id from group session key:
+ *   agent:<agent>:<channel>:group:oc_xxx
+ */
+export function parseGroupChatIdFromSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return undefined;
+  const m = sessionKey.match(/^agent:[^:]+:[^:]+:group:(oc_[A-Za-z0-9]+)$/);
+  return m?.[1];
+}

@@ -15,7 +15,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
 import type { EventBus } from "./event-bus.js";
 import type { ObserverEvent, ObserverTokens } from "./types.js";
-import { now, pickNumber, pickObject, pickString } from "./util.js";
+import { now, parseOpenIdFromDmSessionKey, pickNumber, pickObject, pickString } from "./util.js";
 
 /** Hooks we care about. */
 const OBSERVED_HOOKS = [
@@ -101,6 +101,12 @@ function normalize(
     agentId: pickString(ctx, "agentId"),
     channel: pickString(ctx, "channelId") ?? pickString(ctx, "channel"),
     traceId: extractTraceId(event, ctx),
+    openId:
+      pickString(event, "openId") ??
+      pickString(ctx, "openId") ??
+      parseOpenIdFromDmSessionKey(
+        pickString(event, "sessionKey") ?? pickString(ctx, "sessionKey"),
+      ),
     payload: { ...event, __ctx: slimCtx(ctx) },
   };
 
@@ -114,6 +120,12 @@ function normalize(
       base.provider = pickString(event, "provider");
       base.model = pickString(event, "model");
       base.tokens = extractTokens(pickObject(event, "usage"));
+      break;
+    }
+    case "message_received": {
+      const metadata = pickObject(event, "metadata");
+      base.openId = pickString(metadata, "senderId") ?? base.openId;
+      base.senderName = pickString(metadata, "senderName");
       break;
     }
     case "before_tool_call":

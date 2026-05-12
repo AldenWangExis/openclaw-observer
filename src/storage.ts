@@ -17,8 +17,9 @@ import type { Database as SqliteDatabase, Statement } from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { runMigrations } from "./migrations.js";
 import type { ObserverEvent, SessionState, SessionStatus } from "./types.js";
-import { safeStringify } from "./util.js";
+import { parseGroupChatIdFromSessionKey, safeStringify } from "./util.js";
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS events (
@@ -85,6 +86,22 @@ export interface StorageStats {
   lastFlushError?: string;
 }
 
+export interface KnownUser {
+  openId: string;
+  senderName?: string;
+  firstSeen: number;
+  lastSeen: number;
+  messageCount: number;
+  sessionCount: number;
+}
+
+export interface KnownGroup {
+  chatId: string;
+  groupName: string;
+  source: string;
+  updatedAt: number;
+}
+
 export class Storage {
   private db: SqliteDatabase | null = null;
   private insertStmt: Statement | null = null;
@@ -125,6 +142,7 @@ export class Storage {
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA_SQL);
+    runMigrations(this.db, this.logger);
 
     this.insertStmt = this.db.prepare(`
       INSERT OR IGNORE INTO events (
@@ -134,6 +152,7 @@ export class Storage {
         tool_name, tool_call_id, tool_status,
         provider, model, duration_ms,
         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_total,
+        open_id, sender_name,
         payload
       ) VALUES (
         @id, @ts, @seq, @category, @type,
@@ -142,6 +161,7 @@ export class Storage {
         @tool_name, @tool_call_id, @tool_status,
         @provider, @model, @duration_ms,
         @tokens_input, @tokens_output, @tokens_cache_read, @tokens_cache_write, @tokens_total,
+        @open_id, @sender_name,
         @payload
       )
     `);
@@ -308,6 +328,7 @@ export class Storage {
     sinceTs?: number;
     afterSeq?: number;
     session?: string;
+    openId?: string;
     type?: string;
     category?: string;
   } = {}): ObserverEvent[] {
@@ -326,6 +347,10 @@ export class Storage {
     if (opts.session) {
       wheres.push("session_key = ?");
       params.push(opts.session);
+    }
+    if (opts.openId) {
+      wheres.push("open_id = ?");
+      params.push(opts.openId);
     }
     if (opts.type) {
       wheres.push("type = ?");
@@ -369,7 +394,7 @@ export class Storage {
    *  - `total`: prefer `tokens_total` if non-NULL, else `input + output`,
    *    matching `addInto()`.
    */
-  queryTokens(opts: { sinceTs?: number } = {}): TokenSnapshot {
+  queryTokens(opts: { sinceTs?: number; openId?: string } = {}): TokenSnapshot {
     if (!this.ready || !this.db) return emptyTokenSnapshot();
     const sinceTs = opts.sinceTs && opts.sinceTs > 0 ? opts.sinceTs : 0;
     const now = Date.now();
@@ -387,36 +412,42 @@ export class Storage {
       COALESCE(SUM(COALESCE(tokens_total, COALESCE(tokens_input,0) + COALESCE(tokens_output,0))), 0) AS t_tot,
       COUNT(*) AS calls
     `;
-    const BASE_WHERE = `
-      WHERE type = 'llm_output'
-        AND ts >= ?
-        AND (tokens_input IS NOT NULL OR tokens_output IS NOT NULL OR tokens_total IS NOT NULL)
-    `;
+    const whereParts = [
+      "type = 'llm_output'",
+      "ts >= ?",
+      "(tokens_input IS NOT NULL OR tokens_output IS NOT NULL OR tokens_total IS NOT NULL)",
+    ];
+    const baseParams: unknown[] = [sinceTs];
+    if (opts.openId) {
+      whereParts.push("open_id = ?");
+      baseParams.push(opts.openId);
+    }
+    const BASE_WHERE = `WHERE ${whereParts.join(" AND ")}`;
 
     try {
       const overallRow = this.db
         .prepare(`SELECT ${SUM_EXPR} FROM events ${BASE_WHERE}`)
-        .get(sinceTs) as TokenAggRow | undefined;
+        .get(...baseParams) as TokenAggRow | undefined;
 
       const hourRow = this.db
         .prepare(`SELECT ${SUM_EXPR} FROM events ${BASE_WHERE} AND ts >= ?`)
-        .get(sinceTs, hourCutoff) as TokenAggRow | undefined;
+        .get(...baseParams, hourCutoff) as TokenAggRow | undefined;
 
       const dayRow = this.db
         .prepare(`SELECT ${SUM_EXPR} FROM events ${BASE_WHERE} AND ts >= ?`)
-        .get(sinceTs, dayCutoff) as TokenAggRow | undefined;
+        .get(...baseParams, dayCutoff) as TokenAggRow | undefined;
 
       const sessionRows = this.db
         .prepare(
           `SELECT session_key AS k, ${SUM_EXPR} FROM events ${BASE_WHERE} AND session_key IS NOT NULL GROUP BY session_key`,
         )
-        .all(sinceTs) as TokenAggKeyedRow[];
+        .all(...baseParams) as TokenAggKeyedRow[];
 
       const agentRows = this.db
         .prepare(
           `SELECT agent_id AS k, ${SUM_EXPR} FROM events ${BASE_WHERE} AND agent_id IS NOT NULL GROUP BY agent_id`,
         )
-        .all(sinceTs) as TokenAggKeyedRow[];
+        .all(...baseParams) as TokenAggKeyedRow[];
 
       // Model key is "provider/model" (or just one of them) — match the
       // in-memory `formatModelKey()` exactly.
@@ -432,7 +463,7 @@ export class Storage {
            FROM events ${BASE_WHERE} AND (provider IS NOT NULL OR model IS NOT NULL)
            GROUP BY k`,
         )
-        .all(sinceTs) as TokenAggKeyedRow[];
+        .all(...baseParams) as TokenAggKeyedRow[];
 
       return {
         overall: rowToBucket(overallRow),
@@ -480,10 +511,11 @@ export class Storage {
    * Returns [] if storage is not ready (memory-only fallback) — caller
    * should then fall back to the in-memory tracker.
    */
-  querySessions(opts: { limit?: number; sinceTs?: number } = {}): SessionState[] {
+  querySessions(opts: { limit?: number; sinceTs?: number; openId?: string } = {}): SessionState[] {
     if (!this.ready || !this.db) return [];
     const limit = clampInt(opts.limit, 1, 1000, 200);
     const sinceTs = opts.sinceTs && opts.sinceTs > 0 ? opts.sinceTs : 0;
+    const openId = opts.openId && opts.openId.trim().length > 0 ? opts.openId.trim() : undefined;
 
     // Type IDs that the tracker reads. Keep these in sync with the
     // STATUS_FROM_HOOK / currentAction logic in session-tracker.ts.
@@ -510,6 +542,9 @@ export class Storage {
     // Build IN (?, ?, …) placeholders so prepared-statement caching still works.
     const statusPlaceholders = STATUS_TYPES.map(() => "?").join(",");
     const actionPlaceholders = ACTION_TYPES.map(() => "?").join(",");
+    const openIdFilter = openId
+      ? `AND session_key IN (SELECT DISTINCT session_key FROM events WHERE open_id = ?)`
+      : "";
 
     const sql = `
       WITH base AS (
@@ -525,9 +560,14 @@ export class Storage {
           COALESCE(SUM(tokens_total), 0) AS t_tot,
           MIN(parent_session_key) AS parent_session_key,
           MIN(agent_id) AS agent_id,
-          MIN(channel) AS channel
+          MIN(channel) AS channel,
+          CASE
+            WHEN session_key GLOB 'agent:*:group:oc_*' AND INSTR(session_key, ':group:') > 0
+              THEN SUBSTR(session_key, INSTR(session_key, ':group:') + 7)
+            ELSE NULL
+          END AS group_chat_id
         FROM events
-        WHERE session_key IS NOT NULL AND ts >= ?
+        WHERE session_key IS NOT NULL AND ts >= ? ${openIdFilter}
         GROUP BY session_key
       ),
       last_status AS (
@@ -559,6 +599,7 @@ export class Storage {
         base.first_seen, base.last_seen, base.event_count,
         base.t_in, base.t_out, base.t_cr, base.t_cw, base.t_tot,
         base.parent_session_key, base.agent_id, base.channel,
+        base.group_chat_id, ga.group_name,
         last_status.type   AS status_type,
         last_action.type   AS action_type,
         last_action.ts     AS action_ts,
@@ -566,6 +607,7 @@ export class Storage {
         last_action.model     AS action_model,
         first_msg.payload AS first_msg_payload
       FROM base
+      LEFT JOIN group_alias ga ON ga.chat_id = base.group_chat_id
       LEFT JOIN last_status ON last_status.session_key = base.session_key
       LEFT JOIN last_action ON last_action.session_key = base.session_key
       LEFT JOIN first_msg   ON first_msg.session_key   = base.session_key
@@ -574,20 +616,91 @@ export class Storage {
     `;
 
     try {
+      const args: unknown[] = [
+        sinceTs,
+        ...(openId ? [openId] : []),
+        ...STATUS_TYPES,
+        sinceTs,
+        ...ACTION_TYPES,
+        sinceTs,
+        sinceTs,
+        limit,
+      ];
       const rows = this.db
         .prepare(sql)
-        .all(
-          sinceTs,
-          ...STATUS_TYPES,
-          sinceTs,
-          ...ACTION_TYPES,
-          sinceTs,
-          sinceTs,
-          limit,
-        ) as SessionRow[];
+        .all(...args) as SessionRow[];
       return rows.map(rowToSessionState);
     } catch (err) {
       this.logger.warn(`[observer] querySessions failed: ${errMsg(err)}`);
+      return [];
+    }
+  }
+
+  listKnownGroups(opts: { limit?: number } = {}): KnownGroup[] {
+    if (!this.ready || !this.db) return [];
+    const limit = clampInt(opts.limit, 1, 1000, 200);
+    const sql = `
+      SELECT
+        chat_id AS chat_id,
+        COALESCE(group_name, chat_id) AS group_name,
+        source AS source,
+        updated_at AS updated_at
+      FROM group_alias
+      ORDER BY updated_at DESC, chat_id ASC
+      LIMIT ?
+    `;
+    try {
+      const rows = this.db.prepare(sql).all(limit) as KnownGroupRow[];
+      return rows.map((r) => ({
+        chatId: r.chat_id,
+        groupName: r.group_name,
+        source: r.source,
+        updatedAt: r.updated_at,
+      }));
+    } catch (err) {
+      this.logger.warn(`[observer] listKnownGroups failed: ${errMsg(err)}`);
+      return [];
+    }
+  }
+
+  listKnownUsers(opts: { limit?: number } = {}): KnownUser[] {
+    if (!this.ready || !this.db) return [];
+    const limit = clampInt(opts.limit, 1, 1000, 200);
+    const sql = `
+      WITH latest_name AS (
+        SELECT
+          open_id,
+          sender_name,
+          ROW_NUMBER() OVER (PARTITION BY open_id ORDER BY ts DESC, seq DESC) AS rn
+        FROM events
+        WHERE open_id IS NOT NULL AND sender_name IS NOT NULL
+      )
+      SELECT
+        e.open_id AS open_id,
+        ln.sender_name AS sender_name,
+        MIN(e.ts) AS first_seen,
+        MAX(e.ts) AS last_seen,
+        SUM(CASE WHEN e.type = 'message_received' THEN 1 ELSE 0 END) AS message_count,
+        COUNT(DISTINCT e.session_key) AS session_count
+      FROM events e
+      LEFT JOIN latest_name ln ON ln.open_id = e.open_id AND ln.rn = 1
+      WHERE e.open_id IS NOT NULL
+      GROUP BY e.open_id, ln.sender_name
+      ORDER BY last_seen DESC
+      LIMIT ?
+    `;
+    try {
+      const rows = this.db.prepare(sql).all(limit) as KnownUserRow[];
+      return rows.map((r) => ({
+        openId: r.open_id,
+        senderName: r.sender_name ?? undefined,
+        firstSeen: r.first_seen,
+        lastSeen: r.last_seen,
+        messageCount: r.message_count,
+        sessionCount: r.session_count,
+      }));
+    } catch (err) {
+      this.logger.warn(`[observer] listKnownUsers failed: ${errMsg(err)}`);
       return [];
     }
   }
@@ -639,6 +752,8 @@ interface Row {
   tokens_cache_read: number | null;
   tokens_cache_write: number | null;
   tokens_total: number | null;
+  open_id: string | null;
+  sender_name: string | null;
   payload: string;
 }
 
@@ -667,6 +782,8 @@ function toRow(e: ObserverEvent): Row {
     tokens_cache_read: e.tokens?.cacheRead ?? null,
     tokens_cache_write: e.tokens?.cacheWrite ?? null,
     tokens_total: e.tokens?.total ?? null,
+    open_id: e.openId ?? null,
+    sender_name: e.senderName ?? null,
     payload: safeStringify(e.payload),
   };
 }
@@ -692,6 +809,8 @@ interface SessionRow {
   parent_session_key: string | null;
   agent_id: string | null;
   channel: string | null;
+  group_chat_id: string | null;
+  group_name: string | null;
   status_type: string | null;
   action_type: string | null;
   action_ts: number | null;
@@ -732,6 +851,9 @@ function rowToSessionState(r: SessionRow): SessionState {
   if (r.parent_session_key) state.parentSessionKey = r.parent_session_key;
   if (r.agent_id) state.agentId = r.agent_id;
   if (r.channel) state.channel = r.channel;
+  const groupChatId = r.group_chat_id ?? parseGroupChatIdFromSessionKey(r.session_key);
+  if (groupChatId) state.groupChatId = groupChatId;
+  if (r.group_name && r.group_name.trim().length > 0) state.groupName = r.group_name;
 
   // currentAction / currentActionStart: replay the action_type's effect
   // exactly like session-tracker.ts does in `apply()`.
@@ -823,6 +945,8 @@ export function rowToEvent(r: DbEventRow): ObserverEvent {
   if (r.provider) evt.provider = r.provider;
   if (r.model) evt.model = r.model;
   if (r.duration_ms != null) evt.durationMs = r.duration_ms;
+  if (r.open_id) evt.openId = r.open_id;
+  if (r.sender_name) evt.senderName = r.sender_name;
   if (Object.keys(tokens).length) evt.tokens = tokens;
   return evt;
 }
@@ -866,6 +990,22 @@ interface TokenAggRow {
 
 interface TokenAggKeyedRow extends TokenAggRow {
   k: string;
+}
+
+interface KnownUserRow {
+  open_id: string;
+  sender_name: string | null;
+  first_seen: number;
+  last_seen: number;
+  message_count: number;
+  session_count: number;
+}
+
+interface KnownGroupRow {
+  chat_id: string;
+  group_name: string;
+  source: string;
+  updated_at: number;
 }
 
 function emptyBucket(): TokenBucket {

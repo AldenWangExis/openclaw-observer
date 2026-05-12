@@ -41,6 +41,8 @@ export interface ObserverEvent {
   agentId?: string;
   channel?: string;
   traceId?: string;
+  openId?: string;
+  senderName?: string;
   /** For subagent_spawning: the parent session that spawned the child. */
   parentSessionKey?: string;
 
@@ -76,6 +78,8 @@ export interface SessionState {
   parentSessionKey?: string;
   agentId?: string;
   channel?: string;
+  groupChatId?: string;
+  groupName?: string;
   firstSeen: number;
   lastSeen: number;
   status: SessionStatus;
