@@ -187,6 +187,7 @@ const state = {
   eventIds: new Set(),   // de-dupe backlog replay on reconnect
   sessions: new Map(),   // sessionKey → summary
   usersByOpenId: new Map(), // openId -> display name (from /api/users)
+  groupsByChatId: new Map(), // chatId -> group display name (from /api/groups)
   tokens: null,          // latest /api/tokens snapshot
   selectedEventId: null,
   selectedSessionKey: null,
@@ -407,12 +408,25 @@ function parseDmOpenId(sessionKey) {
   return m ? m[1] : null;
 }
 
+function parseGroupChatId(sessionKey) {
+  if (!sessionKey) return null;
+  const m = sessionKey.match(/^agent:[^:]+:[^:]+:group:(oc_[A-Za-z0-9]+)$/);
+  return m ? m[1] : null;
+}
+
 function sessionTitleForDisplay(session) {
-  // Only do open_id -> username mapping for direct chats.
-  // Group/cron sessions keep the original behavior.
+  // DM: open_id -> username
   const dmOpenId = parseDmOpenId(session.sessionKey);
-  if (!dmOpenId) return session.agentId || "agent";
-  return state.usersByOpenId.get(dmOpenId) || dmOpenId;
+  if (dmOpenId) return state.usersByOpenId.get(dmOpenId) || dmOpenId;
+
+  // Group: chat_id -> group name
+  const groupChatId = session.groupChatId || parseGroupChatId(session.sessionKey);
+  if (groupChatId) {
+    return session.groupName || state.groupsByChatId.get(groupChatId) || groupChatId;
+  }
+
+  // Fallback: keep original non-chat session rendering behavior.
+  return session.agentId || "agent";
 }
 
 function renderEvents() {
@@ -1109,11 +1123,12 @@ document.addEventListener("keydown", (ev) => {
 
 async function pollAux() {
   try {
-    const [sRes, tRes, stRes, uRes] = await Promise.all([
+    const [sRes, tRes, stRes, uRes, gRes] = await Promise.all([
       fetch("/api/sessions").then((r) => r.json()).catch(() => null),
       fetch("/api/tokens").then((r) => r.json()).catch(() => null),
       fetch("/api/stats").then((r) => r.json()).catch(() => null),
       fetch("/api/users").then((r) => r.json()).catch(() => null),
+      fetch("/api/groups").then((r) => r.json()).catch(() => null),
     ]);
     if (sRes && Array.isArray(sRes.sessions)) {
       // Merge server truth into local (server is authoritative for status)
@@ -1123,6 +1138,8 @@ async function pollAux() {
           parentSessionKey: s.parentSessionKey,
           agentId: s.agentId,
           channel: s.channel,
+          groupChatId: s.groupChatId,
+          groupName: s.groupName,
           firstSeen: s.firstSeen,
           lastSeen: s.lastSeen,
           status: s.status,
@@ -1145,6 +1162,15 @@ async function pollAux() {
         if (!u || !u.openId) continue;
         // Prefer senderName; fallback to openId so renderer always has a value.
         state.usersByOpenId.set(u.openId, u.senderName || u.openId);
+      }
+      renderSessions();
+    }
+    if (gRes && Array.isArray(gRes.groups)) {
+      state.groupsByChatId.clear();
+      for (const g of gRes.groups) {
+        if (!g || !g.chatId) continue;
+        // Prefer human-readable groupName; fallback to chatId.
+        state.groupsByChatId.set(g.chatId, g.groupName || g.chatId);
       }
       renderSessions();
     }
