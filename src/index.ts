@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { EventBus } from "./event-bus.js";
 import type { ObserverEvent } from "./types.js";
 import { registerObserverHooks } from "./hooks.js";
-import { subscribeDiagnosticEvents } from "./diagnostics.js";
+import { subscribeDiagnosticEvents, type DiagnosticUnsubscribe } from "./diagnostics.js";
 import { Storage } from "./storage.js";
 import { ObserverHttpServer } from "./http-server.js";
 import { SessionTracker } from "./session-tracker.js";
@@ -33,11 +33,22 @@ interface ObserverConfig {
   bufferSize: number;
   flushIntervalMs: number;
   flushBatchSize: number;
-  captureContent: boolean;
+  maxQueueSize: number;
   redact: {
     enabled: boolean;
     maxFieldBytes: number;
   };
+}
+
+interface ObserverSingleton {
+  bus: EventBus;
+  storage: Storage;
+  httpServer: ObserverHttpServer;
+  statsTimer: NodeJS.Timeout;
+  diagUnsubscribe: DiagnosticUnsubscribe | null;
+  shuttingDown: boolean;
+  logger: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void };
+  registeredHooks: number;
 }
 
 const DEFAULTS: ObserverConfig = {
@@ -49,7 +60,7 @@ const DEFAULTS: ObserverConfig = {
   bufferSize: 5000,
   flushIntervalMs: 1000,
   flushBatchSize: 500,
-  captureContent: true,
+  maxQueueSize: 5000,
   redact: {
     enabled: true,
     maxFieldBytes: 51200,
@@ -67,7 +78,9 @@ function mergeConfig(input: unknown): ObserverConfig {
     bufferSize: cfg.bufferSize ?? DEFAULTS.bufferSize,
     flushIntervalMs: cfg.flushIntervalMs ?? DEFAULTS.flushIntervalMs,
     flushBatchSize: cfg.flushBatchSize ?? DEFAULTS.flushBatchSize,
-    captureContent: cfg.captureContent ?? DEFAULTS.captureContent,
+    maxQueueSize:
+      cfg.maxQueueSize ??
+      Math.max(DEFAULTS.maxQueueSize, (cfg.flushBatchSize ?? DEFAULTS.flushBatchSize) * 10),
     redact: {
       enabled: cfg.redact?.enabled ?? DEFAULTS.redact.enabled,
       maxFieldBytes: cfg.redact?.maxFieldBytes ?? DEFAULTS.redact.maxFieldBytes,
@@ -87,11 +100,6 @@ const observerPlugin = {
     // storage instance across all of them; otherwise hook callbacks get
     // sprayed over N sibling buses and the one bound to the HTTP server gets
     // only ~1/N of the traffic (how /api/tokens stayed empty).
-    type ObserverSingleton = {
-      bus: EventBus;
-      logger: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void };
-      registeredHooks: number;
-    };
     const globalKey = Symbol.for("openclaw-observer/singleton");
     const g = globalThis as unknown as { [k: symbol]: ObserverSingleton | undefined };
     if (g[globalKey]) {
@@ -113,6 +121,7 @@ const observerPlugin = {
       } catch (err) {
         api.logger.warn(`[observer] hook re-bind failed: ${(err as Error).message}`);
       }
+      rebindDiagnosticSubscription(api, existing);
       return;
     }
 
@@ -154,6 +163,7 @@ const observerPlugin = {
         dbPath,
         flushIntervalMs: config.flushIntervalMs,
         flushBatchSize: config.flushBatchSize,
+        maxQueueSize: config.maxQueueSize,
         retentionDays: config.retentionDays,
       },
       {
@@ -205,10 +215,7 @@ const observerPlugin = {
     statsTimer.unref?.();
 
     // Subscribe to diagnostic events asynchronously; don't block register().
-    void subscribeDiagnosticEvents(bus, {
-      info: (m) => api.logger.info(m),
-      warn: (m) => api.logger.warn(m),
-    });
+    let singleton: ObserverSingleton | null = null;
 
     // ── M4: HTTP + WebSocket server (serves from bus) ──
     const webRoot = resolveWebRoot();
@@ -248,8 +255,13 @@ const observerPlugin = {
     }
 
     // Publish singleton so subsequent register() calls can re-bind hooks.
-    g[globalKey] = {
+    singleton = {
       bus,
+      storage,
+      httpServer,
+      statsTimer,
+      diagUnsubscribe: null,
+      shuttingDown: false,
       logger: {
         info: (m) => api.logger.info(m),
         warn: (m) => api.logger.warn(m),
@@ -257,12 +269,67 @@ const observerPlugin = {
       },
       registeredHooks: hookReport.registered.length,
     };
+    g[globalKey] = singleton;
+    rebindDiagnosticSubscription(api, singleton);
+    installShutdownHooks(singleton);
 
     // M8+ will polish the UI on top of the now-rich /api/* endpoints.
   },
 };
 
 export default observerPlugin;
+
+function rebindDiagnosticSubscription(api: OpenClawPluginApi, singleton: ObserverSingleton): void {
+  try {
+    singleton.diagUnsubscribe?.();
+  } catch (err) {
+    api.logger.warn(`[observer] diagnostic unsubscribe failed: ${(err as Error).message}`);
+  }
+  singleton.diagUnsubscribe = null;
+
+  void subscribeDiagnosticEvents(singleton.bus, {
+    info: (m) => api.logger.info(m),
+    warn: (m) => api.logger.warn(m),
+  })
+    .then((unsubscribe) => {
+      singleton.diagUnsubscribe = unsubscribe;
+    })
+    .catch((err) => {
+      api.logger.warn(`[observer] diagnostic re-bind failed: ${(err as Error).message}`);
+    });
+}
+
+function installShutdownHooks(singleton: ObserverSingleton): void {
+  const shutdown = (reason: string) => {
+    if (singleton.shuttingDown) return;
+    singleton.shuttingDown = true;
+    singleton.logger.info(`[observer] shutdown requested (${reason}); draining storage queue`);
+    try {
+      singleton.diagUnsubscribe?.();
+    } catch {
+      /* ignore */
+    }
+    try {
+      clearInterval(singleton.statsTimer);
+    } catch {
+      /* ignore */
+    }
+    try {
+      singleton.storage.close();
+    } catch (err) {
+      singleton.logger.warn(`[observer] storage close failed during shutdown: ${(err as Error).message}`);
+    }
+    try {
+      singleton.httpServer.stop();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  process.once("beforeExit", () => shutdown("beforeExit"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => shutdown("SIGINT"));
+}
 
 /**
  * Resolve dbPath: if absolute use it; otherwise, relative to this file's

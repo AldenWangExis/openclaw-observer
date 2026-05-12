@@ -184,6 +184,7 @@ function fmtMb(n) {
 
 const state = {
   events: [],            // newest-last array (chronological); capped to MAX_EVENTS
+  eventIds: new Set(),   // de-dupe backlog replay on reconnect
   sessions: new Map(),   // sessionKey → summary
   tokens: null,          // latest /api/tokens snapshot
   selectedEventId: null,
@@ -197,6 +198,8 @@ const state = {
   paused: false,
   connected: false,
   stats: null,
+  lastEventSeq: 0,
+  lastEventTs: 0,
   // cursor for j/k nav — index into the *visible* list
   cursor: -1,
 
@@ -243,7 +246,11 @@ const els = {
 
 let ws;
 function connect() {
-  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  const qs = new URLSearchParams();
+  if (state.lastEventSeq > 0) qs.set("sinceSeq", String(state.lastEventSeq));
+  if (state.lastEventTs > 0) qs.set("sinceTs", String(state.lastEventTs));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + `/ws${suffix}`;
   ws = new WebSocket(url);
   ws.onopen = () => {
     state.connected = true;
@@ -296,10 +303,15 @@ function paintConnection() {
 // Ingest & derived state
 
 function ingestEvent(evt) {
+  if (!evt || !evt.id || state.eventIds.has(evt.id)) return;
   // Keep chronological order (bus sends backlog newest-last, event live).
   state.events.push(evt);
+  state.eventIds.add(evt.id);
+  if (typeof evt.seq === "number") state.lastEventSeq = Math.max(state.lastEventSeq, evt.seq);
+  if (typeof evt.ts === "number") state.lastEventTs = Math.max(state.lastEventTs, evt.ts);
   if (state.events.length > MAX_EVENTS) {
-    state.events.splice(0, state.events.length - MAX_EVENTS);
+    const removed = state.events.splice(0, state.events.length - MAX_EVENTS);
+    removed.forEach((e) => state.eventIds.delete(e.id));
   }
   // Derive a tiny session summary — full one comes from /api/sessions poll.
   if (evt.sessionKey) {
@@ -831,6 +843,7 @@ els.pauseBtn.addEventListener("click", () => {
 });
 els.clearBtn.addEventListener("click", () => {
   state.events = [];
+  state.eventIds.clear();
   state.selectedEventId = null;
   renderEvents();
   renderDetail();

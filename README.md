@@ -143,7 +143,7 @@ Add to your OpenClaw config (the plugin reads its own subtree):
           "port": 10010,
           "bindHost": "0.0.0.0",
           "retentionDays": 7,
-          "captureContent": true,
+          "maxQueueSize": 5000,
           "redact": {
             "enabled": true,
             "maxFieldBytes": 51200
@@ -168,7 +168,7 @@ plus `gateway config.patch` to merge any of these keys.
 | `bufferSize` | `5000` | In-memory ring buffer (100–100000) |
 | `flushIntervalMs` | `1000` | Periodic SQLite flush interval |
 | `flushBatchSize` | `500` | Force flush when queue ≥ this many events |
-| `captureContent` | `true` | Capture prompts/tool params/results. `false` = metadata only |
+| `maxQueueSize` | `5000` | Max queued events before oldest storage-queue entries are dropped |
 | `redact.enabled` | `true` | Mask sensitive fields before they touch the bus |
 | `redact.maxFieldBytes` | `51200` | Per-field byte cap; longer values are truncated |
 
@@ -184,7 +184,10 @@ The dashboard is just a client; you can build your own.
 | `/api/events` | GET | Paged historical events (`?since=<ts>&limit=…&type=…&source=bus\|db`) |
 | `/api/session/:sessionKey` | GET | Single-session summary + recent events |
 | `/api/tokens` | GET | Aggregated token usage by model |
-| `/stream` | WS | Live event stream (events + periodic stats) |
+| `/api/stats` | GET | Bus + storage stats |
+| `/api/health` | GET | Detailed health probe (`storage`, `queueSize`, `lastFlushAgo`, dropped counters) |
+| `/api/metrics` | GET | Prometheus text metrics for the observer plugin itself |
+| `/ws` | WS | Live event stream with backlog replay (`?sinceSeq=&sinceTs=` resume hints) |
 
 Every event has the same shape (see [`src/types.ts`](src/types.ts)):
 
@@ -227,7 +230,7 @@ interface ObserverEvent {
 │  │                                                          │        │
 │  └────────────────────────────┬─────────────────────────────┘        │
 │                               ↓                                      │
-│   HTTP/WS server on 0.0.0.0:10010 (default) → SPA + REST + /stream  │
+│   HTTP/WS server on 0.0.0.0:10010 (default) → SPA + REST + /ws      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -270,11 +273,8 @@ RAM** and **<2 % CPU**.
   WebSocket clients. The full unredacted payload never leaves the hook
   callback frame, but redaction is best-effort regex-based — assume a
   determined reader of the dashboard can still glean intent.
-- Set `captureContent: false` to record only metadata (durations,
-  token counts, types) and skip every prompt/tool body — useful when
-  the gateway is processing third-party PII.
 - The SQLite file may grow to GBs over a busy week. Lower
-  `retentionDays` or set a smaller `bufferSize` if disk is tight.
+  `retentionDays`, `bufferSize`, or `maxQueueSize` if disk or memory is tight.
 
 ---
 

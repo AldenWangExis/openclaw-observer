@@ -94,8 +94,6 @@ export class TokenAggregator {
     const snap = this.snapshot();
     return {
       overall: snap.overall,
-      lastHour: snap.lastHour,
-      lastDay: snap.lastDay,
       bySession: Object.fromEntries(snap.session),
       byModel: Object.fromEntries(snap.model),
       byAgent: Object.fromEntries(snap.agent),

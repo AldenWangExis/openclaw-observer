@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_ts          ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_events_seq         ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_session_ts  ON events(session_key, ts);
 CREATE INDEX IF NOT EXISTS idx_events_run_ts      ON events(run_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_type_ts     ON events(type, ts);
@@ -59,6 +60,7 @@ export interface StorageOptions {
   dbPath: string;
   flushIntervalMs: number;
   flushBatchSize: number;
+  maxQueueSize?: number;
   retentionDays: number;
 }
 
@@ -69,12 +71,18 @@ export interface StorageLogger {
 }
 
 export interface StorageStats {
+  ready: boolean;
   rowCount: number;
   dbPath: string;
   queueSize: number;
+  maxQueueSize: number;
   flushedEvents: number;
   flushedBatches: number;
   droppedBatches: number;
+  droppedEvents: number;
+  lastFlushAt: number;
+  lastFlushDurationMs: number;
+  lastFlushError?: string;
 }
 
 export class Storage {
@@ -91,6 +99,11 @@ export class Storage {
   private flushedEvents = 0;
   private flushedBatches = 0;
   private droppedBatches = 0;
+  private droppedEvents = 0;
+  private readonly maxQueueSize: number;
+  private lastFlushAt = 0;
+  private lastFlushDurationMs = 0;
+  private lastFlushError: string | undefined;
   private closed = false;
   // True only after init() has fully prepared the DB and statements.
   // All read/write helpers must be no-ops when !ready so the plugin can
@@ -100,6 +113,7 @@ export class Storage {
   constructor(opts: StorageOptions, logger: StorageLogger) {
     this.opts = opts;
     this.logger = logger;
+    this.maxQueueSize = Math.max(1, opts.maxQueueSize ?? opts.flushBatchSize * 10);
   }
 
   /** Open the DB, create schema, prepare statements, start flush loop. */
@@ -107,6 +121,7 @@ export class Storage {
     mkdirSync(dirname(this.opts.dbPath), { recursive: true });
     this.db = new Database(this.opts.dbPath);
     this.db.pragma("journal_mode = WAL");
+    this.db.pragma("wal_autocheckpoint = 1000");
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA_SQL);
@@ -183,6 +198,16 @@ export class Storage {
   /** Enqueue a single event. Non-blocking. */
   enqueue(evt: ObserverEvent): void {
     if (this.closed || !this.ready) return;
+    if (this.queue.length >= this.maxQueueSize) {
+      this.queue.shift();
+      this.droppedEvents += 1;
+      this.droppedBatches += 1;
+      if (this.droppedEvents === 1 || this.droppedEvents % 1000 === 0) {
+        this.logger.warn(
+          `[observer] storage queue overflow: dropped oldest event (droppedEvents=${this.droppedEvents}, maxQueueSize=${this.maxQueueSize})`,
+        );
+      }
+    }
     this.queue.push(evt);
     if (this.queue.length >= this.opts.flushBatchSize) {
       this.flush();
@@ -198,6 +223,7 @@ export class Storage {
     const batch = this.queue;
     this.queue = [];
 
+    const started = Date.now();
     try {
       const insertMany = db.transaction((rows: ObserverEvent[]) => {
         for (const r of rows) {
@@ -205,10 +231,17 @@ export class Storage {
         }
       });
       insertMany(batch);
+      this.lastFlushAt = Date.now();
+      this.lastFlushDurationMs = this.lastFlushAt - started;
+      this.lastFlushError = undefined;
       this.flushedEvents += batch.length;
       this.flushedBatches += 1;
     } catch (err) {
+      this.lastFlushAt = Date.now();
+      this.lastFlushDurationMs = this.lastFlushAt - started;
+      this.lastFlushError = errMsg(err);
       this.droppedBatches += 1;
+      this.droppedEvents += batch.length;
       this.logger.error(
         `[observer] flush failed (batch=${batch.length}, dropped): ${errMsg(err)}`,
       );
@@ -240,14 +273,21 @@ export class Storage {
   }
 
   stats(): StorageStats {
-    return {
+    const stats: StorageStats = {
+      ready: this.isReady(),
       rowCount: this.rowCount(),
       dbPath: this.ready ? this.opts.dbPath : `${this.opts.dbPath} (memory-only)`,
       queueSize: this.queue.length,
+      maxQueueSize: this.maxQueueSize,
       flushedEvents: this.flushedEvents,
       flushedBatches: this.flushedBatches,
       droppedBatches: this.droppedBatches,
+      droppedEvents: this.droppedEvents,
+      lastFlushAt: this.lastFlushAt,
+      lastFlushDurationMs: this.lastFlushDurationMs,
     };
+    if (this.lastFlushError) stats.lastFlushError = this.lastFlushError;
+    return stats;
   }
 
   /**
@@ -266,6 +306,7 @@ export class Storage {
   queryRecentEvents(opts: {
     limit?: number;
     sinceTs?: number;
+    afterSeq?: number;
     session?: string;
     type?: string;
     category?: string;
@@ -277,6 +318,10 @@ export class Storage {
     if (opts.sinceTs && opts.sinceTs > 0) {
       wheres.push("ts >= ?");
       params.push(opts.sinceTs);
+    }
+    if (opts.afterSeq && opts.afterSeq > 0) {
+      wheres.push("seq > ?");
+      params.push(opts.afterSeq);
     }
     if (opts.session) {
       wheres.push("session_key = ?");
@@ -549,7 +594,6 @@ export class Storage {
 
   close(): void {
     if (this.closed) return;
-    this.closed = true;
     if (this.flushTimer) clearInterval(this.flushTimer);
     if (this.ttlTimer) clearInterval(this.ttlTimer);
     // Final drain
@@ -558,6 +602,7 @@ export class Storage {
     } catch {
       /* ignore */
     }
+    this.closed = true;
     if (this.db) {
       try {
         this.db.close();

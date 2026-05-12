@@ -21,6 +21,8 @@ export class EventBus {
   private buffer: ObserverEvent[] = [];
   private subscribers = new Set<ObserverEventListener>();
   private seq = 0;
+  private readonly typeCounts = new Map<string, number>();
+  private readonly categoryCounts = new Map<string, number>();
 
   constructor(opts: EventBusOptions) {
     this.bufferSize = Math.max(100, opts.bufferSize);
@@ -43,6 +45,8 @@ export class EventBus {
     if (this.buffer.length > this.bufferSize) {
       this.buffer.shift();
     }
+    increment(this.typeCounts, full.type);
+    increment(this.categoryCounts, full.category);
 
     for (const sub of this.subscribers) {
       try {
@@ -68,11 +72,19 @@ export class EventBus {
   }
 
   /** Observability: current buffer size / subscriber count. */
-  stats(): { bufferedEvents: number; subscribers: number; totalSeq: number } {
+  stats(): {
+    bufferedEvents: number;
+    subscribers: number;
+    totalSeq: number;
+    eventsByType: Record<string, number>;
+    eventsByCategory: Record<string, number>;
+  } {
     return {
       bufferedEvents: this.buffer.length,
       subscribers: this.subscribers.size,
       totalSeq: this.seq,
+      eventsByType: Object.fromEntries(this.typeCounts),
+      eventsByCategory: Object.fromEntries(this.categoryCounts),
     };
   }
 
@@ -80,6 +92,12 @@ export class EventBus {
   reset(): void {
     this.buffer = [];
     this.seq = 0;
+    this.typeCounts.clear();
+    this.categoryCounts.clear();
     // Intentionally do not clear subscribers.
   }
+}
+
+function increment(map: Map<string, number>, key: string): void {
+  map.set(key, (map.get(key) ?? 0) + 1);
 }

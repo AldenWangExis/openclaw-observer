@@ -91,12 +91,12 @@ function redactString(s: string, key: string, maxBytes: number): string {
   // key says "password" etc → nuke the value
   if (KEY_PATTERNS.test(key)) return MASK;
 
-  // value patterns
+  // Do not call RegExp#test() on these shared /g regex instances:
+  // test() mutates lastIndex and can make the next field skip a secret.
+  // replace() is idempotent and scans from the beginning every call.
   let masked = s;
   for (const p of VALUE_PATTERNS) {
-    if (p.test(masked)) {
-      masked = masked.replace(p, MASK);
-    }
+    masked = masked.replace(p, MASK);
   }
 
   // Truncate if too long — but spare recognized safe text keys from masking,

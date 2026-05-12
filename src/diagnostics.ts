@@ -15,14 +15,14 @@ import type { ObserverEvent, ObserverTokens } from "./types.js";
 import { now, pickNumber, pickObject, pickString } from "./util.js";
 
 /** Unsubscribe function returned by the runtime. */
-type Unsubscribe = () => void;
+export type DiagnosticUnsubscribe = () => void;
 
 /**
  * Attempt to dynamically load the diagnostic-runtime module from the host
  * OpenClaw install. Returns null when unavailable (plugin still works).
  */
 async function loadDiagnosticRuntime(): Promise<
-  ((listener: (evt: unknown) => void) => Unsubscribe) | null
+  ((listener: (evt: unknown) => void) => DiagnosticUnsubscribe) | null
 > {
   try {
     const mod = (await import("openclaw/plugin-sdk")) as unknown as Record<
@@ -31,7 +31,7 @@ async function loadDiagnosticRuntime(): Promise<
     >;
     const fn = mod["onDiagnosticEvent"];
     if (typeof fn === "function") {
-      return fn as (listener: (evt: unknown) => void) => Unsubscribe;
+      return fn as (listener: (evt: unknown) => void) => DiagnosticUnsubscribe;
     }
   } catch {
     // fall through to secondary probe
@@ -45,7 +45,7 @@ async function loadDiagnosticRuntime(): Promise<
     >;
     const fn = mod["onDiagnosticEvent"];
     if (typeof fn === "function") {
-      return fn as (listener: (evt: unknown) => void) => Unsubscribe;
+      return fn as (listener: (evt: unknown) => void) => DiagnosticUnsubscribe;
     }
   } catch {
     // not available
@@ -57,7 +57,7 @@ async function loadDiagnosticRuntime(): Promise<
 export async function subscribeDiagnosticEvents(
   bus: EventBus,
   logger: { info: (msg: string) => void; warn: (msg: string) => void },
-): Promise<Unsubscribe | null> {
+): Promise<DiagnosticUnsubscribe | null> {
   const onDiag = await loadDiagnosticRuntime();
   if (!onDiag) {
     logger.warn(

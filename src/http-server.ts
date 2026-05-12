@@ -75,7 +75,7 @@ export class ObserverHttpServer {
     });
 
     this.wss = new WebSocketServer({ noServer: true });
-    this.wss.on("connection", (socket) => this.onWsClient(socket));
+    this.wss.on("connection", (socket, req) => this.onWsClient(socket, req));
 
     this.server.on("upgrade", (req, socket, head) => {
       try {
@@ -152,7 +152,10 @@ export class ObserverHttpServer {
       return this.sendEvents(res, url);
     }
     if (url.pathname === "/api/health") {
-      return this.sendJson(res, 200, { ok: true, ts: Date.now() });
+      return this.sendJson(res, 200, this.buildHealth());
+    }
+    if (url.pathname === "/api/metrics") {
+      return this.sendText(res, 200, this.buildPromMetrics());
     }
 
     return this.serveStatic(url.pathname, res);
@@ -164,6 +167,62 @@ export class ObserverHttpServer {
       storage: this.storage?.stats() ?? { rowCount: 0, dbPath: "<disabled>" },
       ts: Date.now(),
     };
+  }
+
+  private buildHealth() {
+    const storageStats = this.storage?.stats();
+    const lastFlushAgo =
+      storageStats?.lastFlushAt && storageStats.lastFlushAt > 0
+        ? Date.now() - storageStats.lastFlushAt
+        : null;
+    return {
+      ok: !this.storage || storageStats?.ready !== false,
+      ts: Date.now(),
+      bus: "healthy",
+      storage: !this.storage ? "disabled" : storageStats?.ready ? "ready" : "memory-only",
+      lastFlushAgo,
+      queueSize: storageStats?.queueSize ?? 0,
+      maxQueueSize: storageStats?.maxQueueSize ?? 0,
+      droppedEvents: storageStats?.droppedEvents ?? 0,
+      lastFlushError: storageStats?.lastFlushError,
+    };
+  }
+
+  private buildPromMetrics(): string {
+    const bs = this.bus.stats();
+    const ss = this.storage?.stats();
+    const lines: string[] = [
+      "# HELP observer_events_total Total observer events seen by this process.",
+      "# TYPE observer_events_total counter",
+    ];
+    for (const [type, count] of Object.entries(bs.eventsByType ?? {})) {
+      lines.push(`observer_events_total{type="${escapePromLabel(type)}"} ${count}`);
+    }
+    lines.push(
+      "# HELP observer_events_by_category_total Total observer events by category.",
+      "# TYPE observer_events_by_category_total counter",
+    );
+    for (const [category, count] of Object.entries(bs.eventsByCategory ?? {})) {
+      lines.push(`observer_events_by_category_total{category="${escapePromLabel(category)}"} ${count}`);
+    }
+    lines.push(
+      "# HELP observer_db_queue_size Current queued events waiting for SQLite flush.",
+      "# TYPE observer_db_queue_size gauge",
+      `observer_db_queue_size ${ss?.queueSize ?? 0}`,
+      "# HELP observer_flush_latency_seconds Duration of the latest SQLite flush.",
+      "# TYPE observer_flush_latency_seconds gauge",
+      `observer_flush_latency_seconds ${((ss?.lastFlushDurationMs ?? 0) / 1000).toFixed(6)}`,
+      "# HELP observer_dropped_batches_total Dropped storage batches or overflow incidents.",
+      "# TYPE observer_dropped_batches_total counter",
+      `observer_dropped_batches_total ${ss?.droppedBatches ?? 0}`,
+      "# HELP observer_dropped_events_total Dropped observer events.",
+      "# TYPE observer_dropped_events_total counter",
+      `observer_dropped_events_total ${ss?.droppedEvents ?? 0}`,
+      "# HELP observer_storage_ready Whether SQLite storage is ready (1=yes, 0=no).",
+      "# TYPE observer_storage_ready gauge",
+      `observer_storage_ready ${ss?.ready ? 1 : 0}`,
+    );
+    return `${lines.join("\n")}\n`;
   }
 
   /**
@@ -264,7 +323,15 @@ export class ObserverHttpServer {
     const useDb = requested !== "bus" && storageReady;
 
     if (!useDb) {
-      const data = this.extras?.tokens() ?? {};
+      const data = { ...((this.extras?.tokens() ?? {}) as Record<string, unknown>) };
+      delete data["lastHour"];
+      delete data["lastDay"];
+      if (this.storage?.isReady()) {
+        const windows = this.storage.queryTokens({ sinceTs: since });
+        data["lastHour"] = windows.lastHour;
+        data["lastDay"] = windows.lastDay;
+        data["windowsSource"] = "db";
+      }
       return this.sendJson(res, 200, { source: "bus", ...data });
     }
 
@@ -276,14 +343,25 @@ export class ObserverHttpServer {
   // WebSocket
   // ────────────────────────────────────────────────────────────────────
 
-  private onWsClient(socket: WebSocket): void {
+  private onWsClient(socket: WebSocket, req: IncomingMessage): void {
     try {
       // Prefer in-memory ring; fall back to DB when the bus is empty
       // (e.g. immediately after a gateway restart before any new events).
-      let backlog = this.bus.recent(WS_INITIAL_BACKLOG);
+      const url = new URL(req.url ?? "/ws", "http://localhost");
+      const sinceSeq = parseIntOr(url.searchParams.get("sinceSeq"), 0);
+      const sinceTs = parseIntOr(url.searchParams.get("sinceTs"), 0);
+      let backlog =
+        sinceSeq > 0
+          ? this.bus.recent(WS_INITIAL_BACKLOG).filter((e) => e.seq > sinceSeq)
+          : this.bus.recent(WS_INITIAL_BACKLOG);
       let backlogSource: "bus" | "db" = "bus";
-      if (backlog.length < BUS_WARM_THRESHOLD && this.storage?.isReady()) {
-        backlog = this.storage.queryRecentEvents({ limit: WS_INITIAL_BACKLOG });
+      if ((backlog.length < BUS_WARM_THRESHOLD || sinceTs > 0) && this.storage?.isReady()) {
+        const dbBacklog = this.storage.queryRecentEvents({
+          limit: WS_INITIAL_BACKLOG,
+          sinceTs: sinceTs > 0 ? sinceTs : undefined,
+          afterSeq: sinceTs > 0 ? undefined : sinceSeq,
+        });
+        backlog = mergeEventsNewestLast(dbBacklog, backlog).slice(-WS_INITIAL_BACKLOG);
         backlogSource = "db";
       }
       socket.send(safeStringify({ type: "backlog", source: backlogSource, events: backlog }));
@@ -349,6 +427,15 @@ export class ObserverHttpServer {
     res.end(json);
   }
 
+  private sendText(res: ServerResponse, status: number, body: string): void {
+    res.writeHead(status, {
+      "content-type": "text/plain; version=0.0.4; charset=utf-8",
+      "cache-control": "no-store",
+      "content-length": String(Buffer.byteLength(body)),
+    });
+    res.end(body);
+  }
+
   private fail(res: ServerResponse, status: number, code: string): void {
     try {
       res.writeHead(status, { "content-type": "application/json" });
@@ -390,6 +477,20 @@ function parseIntOr(s: string | null, d: number): number {
 }
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
+}
+function mergeEventsNewestLast(a: ObserverEvent[], b: ObserverEvent[]): ObserverEvent[] {
+  const seen = new Set<string>();
+  const out: ObserverEvent[] = [];
+  for (const evt of [...a, ...b]) {
+    if (seen.has(evt.id)) continue;
+    seen.add(evt.id);
+    out.push(evt);
+  }
+  out.sort((x, y) => x.ts - y.ts || x.seq - y.seq);
+  return out;
+}
+function escapePromLabel(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/"/g, '\\"');
 }
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
