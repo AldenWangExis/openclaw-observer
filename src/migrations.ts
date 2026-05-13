@@ -70,6 +70,54 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    name: "add_cron_job_alias_table",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS cron_job_alias (
+          job_id      TEXT PRIMARY KEY,
+          job_name    TEXT NOT NULL,
+          enabled     INTEGER,
+          source      TEXT NOT NULL DEFAULT 'derived:session_key',
+          updated_at  INTEGER NOT NULL
+        );
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_cron_job_alias_updated_at ON cron_job_alias(updated_at);`);
+
+      // Backfill from historical cron session keys:
+      // - agent:*:cron:<job_id>
+      // - agent:*:cron:<job_id>:run:<run_id>
+      db.exec(`
+        INSERT OR IGNORE INTO cron_job_alias (job_id, job_name, enabled, source, updated_at)
+        SELECT DISTINCT
+          CASE
+            WHEN INSTR(SUBSTR(session_key, INSTR(session_key, ':cron:') + 6), ':run:') > 0
+              THEN SUBSTR(
+                SUBSTR(session_key, INSTR(session_key, ':cron:') + 6),
+                1,
+                INSTR(SUBSTR(session_key, INSTR(session_key, ':cron:') + 6), ':run:') - 1
+              )
+            ELSE SUBSTR(session_key, INSTR(session_key, ':cron:') + 6)
+          END AS job_id,
+          CASE
+            WHEN INSTR(SUBSTR(session_key, INSTR(session_key, ':cron:') + 6), ':run:') > 0
+              THEN SUBSTR(
+                SUBSTR(session_key, INSTR(session_key, ':cron:') + 6),
+                1,
+                INSTR(SUBSTR(session_key, INSTR(session_key, ':cron:') + 6), ':run:') - 1
+              )
+            ELSE SUBSTR(session_key, INSTR(session_key, ':cron:') + 6)
+          END AS job_name,
+          NULL AS enabled,
+          'derived:session_key' AS source,
+          CAST(strftime('%s', 'now') AS INTEGER) * 1000 AS updated_at
+        FROM events
+        WHERE session_key GLOB 'agent:*:cron:*'
+          AND INSTR(session_key, ':cron:') > 0;
+      `);
+    },
+  },
 ];
 
 export function runMigrations(db: SqliteDatabase, logger: MigrationLogger): void {

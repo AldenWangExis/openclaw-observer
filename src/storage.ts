@@ -19,7 +19,7 @@ import { dirname } from "node:path";
 
 import { runMigrations } from "./migrations.js";
 import type { ObserverEvent, SessionState, SessionStatus } from "./types.js";
-import { parseGroupChatIdFromSessionKey, safeStringify } from "./util.js";
+import { parseCronSessionKey, parseGroupChatIdFromSessionKey, safeStringify } from "./util.js";
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS events (
@@ -98,6 +98,14 @@ export interface KnownUser {
 export interface KnownGroup {
   chatId: string;
   groupName: string;
+  source: string;
+  updatedAt: number;
+}
+
+export interface KnownCronJob {
+  jobId: string;
+  jobName: string;
+  enabled?: boolean;
   source: string;
   updatedAt: number;
 }
@@ -503,8 +511,9 @@ export class Storage {
    * - title       = first text-like field of the earliest message_received
    *   payload, mirroring `firstTextPreview()` in the tracker
    *
-   * Performance: composite query uses three window-function sub-queries
-   * (last_status, last_action, first_msg). All indexed on session_key/ts.
+   * Performance: composite query uses four window-function sub-queries
+   * (last_status, last_action, last_diag_state, first_msg). All indexed on
+   * session_key/ts.
    * For ~10⁵ rows the query is sub-millisecond on a warm cache; for ~10⁶
    * still well under 100ms.
    *
@@ -565,7 +574,25 @@ export class Storage {
             WHEN session_key GLOB 'agent:*:group:oc_*' AND INSTR(session_key, ':group:') > 0
               THEN SUBSTR(session_key, INSTR(session_key, ':group:') + 7)
             ELSE NULL
-          END AS group_chat_id
+          END AS group_chat_id,
+          CASE
+            WHEN session_key GLOB 'agent:*:cron:*' AND INSTR(session_key, ':cron:') > 0
+              THEN CASE
+                WHEN INSTR(SUBSTR(session_key, INSTR(session_key, ':cron:') + 6), ':run:') > 0
+                  THEN SUBSTR(
+                    SUBSTR(session_key, INSTR(session_key, ':cron:') + 6),
+                    1,
+                    INSTR(SUBSTR(session_key, INSTR(session_key, ':cron:') + 6), ':run:') - 1
+                  )
+                ELSE SUBSTR(session_key, INSTR(session_key, ':cron:') + 6)
+              END
+            ELSE NULL
+          END AS cron_job_id,
+          CASE
+            WHEN session_key GLOB 'agent:*:cron:*:run:*' AND INSTR(session_key, ':run:') > 0
+              THEN SUBSTR(session_key, INSTR(session_key, ':run:') + 5)
+            ELSE NULL
+          END AS cron_run_id
         FROM events
         WHERE session_key IS NOT NULL AND ts >= ? ${openIdFilter}
         GROUP BY session_key
@@ -586,6 +613,18 @@ export class Storage {
           WHERE category = 'hook' AND type IN (${actionPlaceholders}) AND ts >= ?
         ) WHERE rn = 1
       ),
+      last_diag_state AS (
+        SELECT session_key, ts, diag_state, diag_reason FROM (
+          SELECT
+            session_key,
+            ts,
+            json_extract(payload, '$.state') AS diag_state,
+            json_extract(payload, '$.reason') AS diag_reason,
+            ROW_NUMBER() OVER (PARTITION BY session_key ORDER BY ts DESC, seq DESC) AS rn
+          FROM events
+          WHERE category = 'diag' AND type = 'session.state' AND ts >= ?
+        ) WHERE rn = 1
+      ),
       first_msg AS (
         SELECT session_key, payload FROM (
           SELECT session_key, payload,
@@ -600,16 +639,22 @@ export class Storage {
         base.t_in, base.t_out, base.t_cr, base.t_cw, base.t_tot,
         base.parent_session_key, base.agent_id, base.channel,
         base.group_chat_id, ga.group_name,
+        base.cron_job_id, base.cron_run_id, cja.job_name AS cron_job_name,
         last_status.type   AS status_type,
         last_action.type   AS action_type,
         last_action.ts     AS action_ts,
         last_action.tool_name AS action_tool,
         last_action.model     AS action_model,
+        last_diag_state.diag_state,
+        last_diag_state.diag_reason,
+        last_diag_state.ts AS diag_ts,
         first_msg.payload AS first_msg_payload
       FROM base
       LEFT JOIN group_alias ga ON ga.chat_id = base.group_chat_id
+      LEFT JOIN cron_job_alias cja ON cja.job_id = base.cron_job_id
       LEFT JOIN last_status ON last_status.session_key = base.session_key
       LEFT JOIN last_action ON last_action.session_key = base.session_key
+      LEFT JOIN last_diag_state ON last_diag_state.session_key = base.session_key
       LEFT JOIN first_msg   ON first_msg.session_key   = base.session_key
       ORDER BY base.last_seen DESC
       LIMIT ?
@@ -622,6 +667,7 @@ export class Storage {
         ...STATUS_TYPES,
         sinceTs,
         ...ACTION_TYPES,
+        sinceTs,
         sinceTs,
         sinceTs,
         limit,
@@ -659,6 +705,35 @@ export class Storage {
       }));
     } catch (err) {
       this.logger.warn(`[observer] listKnownGroups failed: ${errMsg(err)}`);
+      return [];
+    }
+  }
+
+  listKnownCronJobs(opts: { limit?: number } = {}): KnownCronJob[] {
+    if (!this.ready || !this.db) return [];
+    const limit = clampInt(opts.limit, 1, 1000, 200);
+    const sql = `
+      SELECT
+        job_id AS job_id,
+        job_name AS job_name,
+        enabled AS enabled,
+        source AS source,
+        updated_at AS updated_at
+      FROM cron_job_alias
+      ORDER BY updated_at DESC, job_id ASC
+      LIMIT ?
+    `;
+    try {
+      const rows = this.db.prepare(sql).all(limit) as KnownCronJobRow[];
+      return rows.map((r) => ({
+        jobId: r.job_id,
+        jobName: r.job_name,
+        enabled: r.enabled == null ? undefined : r.enabled !== 0,
+        source: r.source,
+        updatedAt: r.updated_at,
+      }));
+    } catch (err) {
+      this.logger.warn(`[observer] listKnownCronJobs failed: ${errMsg(err)}`);
       return [];
     }
   }
@@ -811,11 +886,17 @@ interface SessionRow {
   channel: string | null;
   group_chat_id: string | null;
   group_name: string | null;
+  cron_job_id: string | null;
+  cron_run_id: string | null;
+  cron_job_name: string | null;
   status_type: string | null;
   action_type: string | null;
   action_ts: number | null;
   action_tool: string | null;
   action_model: string | null;
+  diag_state: string | null;
+  diag_reason: string | null;
+  diag_ts: number | null;
   first_msg_payload: string | null;
 }
 
@@ -834,12 +915,15 @@ const STATUS_FROM_HOOK: Record<string, SessionStatus> = {
 };
 
 function rowToSessionState(r: SessionRow): SessionState {
+  const hookStatus: SessionStatus = r.status_type
+    ? (STATUS_FROM_HOOK[r.status_type] ?? "active")
+    : "active";
   const state: SessionState = {
     sessionKey: r.session_key,
     firstSeen: r.first_seen,
     lastSeen: r.last_seen,
     eventCount: r.event_count,
-    status: r.status_type ? (STATUS_FROM_HOOK[r.status_type] ?? "active") : "active",
+    status: hookStatus,
     tokens: {
       input: r.t_in,
       output: r.t_out,
@@ -854,6 +938,12 @@ function rowToSessionState(r: SessionRow): SessionState {
   const groupChatId = r.group_chat_id ?? parseGroupChatIdFromSessionKey(r.session_key);
   if (groupChatId) state.groupChatId = groupChatId;
   if (r.group_name && r.group_name.trim().length > 0) state.groupName = r.group_name;
+  const parsedCron = parseCronSessionKey(r.session_key);
+  const cronJobId = r.cron_job_id ?? parsedCron?.cronJobId;
+  const cronRunId = r.cron_run_id ?? parsedCron?.cronRunId;
+  if (cronJobId) state.cronJobId = cronJobId;
+  if (cronRunId) state.cronRunId = cronRunId;
+  if (r.cron_job_name && r.cron_job_name.trim().length > 0) state.cronJobName = r.cron_job_name;
 
   // currentAction / currentActionStart: replay the action_type's effect
   // exactly like session-tracker.ts does in `apply()`.
@@ -867,12 +957,45 @@ function rowToSessionState(r: SessionRow): SessionState {
   // after_tool_call / llm_output / session_end → leave currentAction
   // undefined (the tracker would have cleared them too).
 
+  const diagStatus = statusFromDiagState(r.diag_state, r.diag_reason, r.action_type);
+  if (diagStatus) {
+    state.status = diagStatus;
+    if (diagStatus === "idle" || diagStatus === "done") {
+      state.currentAction = undefined;
+      state.currentActionStart = undefined;
+    }
+  }
+
   if (r.first_msg_payload) {
     const title = extractTitle(r.first_msg_payload);
     if (title) state.title = title;
   }
 
   return state;
+}
+
+function statusFromDiagState(
+  diagState: string | null,
+  diagReason: string | null,
+  actionType: string | null,
+): SessionStatus | undefined {
+  if (!diagState) return undefined;
+  if (diagState === "idle") return diagReason === "run_completed" ? "done" : "idle";
+  if (diagState === "processing") {
+    return actionType === "before_tool_call" ? "tool" : "thinking";
+  }
+  if (
+    diagState === "thinking" ||
+    diagState === "tool" ||
+    diagState === "done" ||
+    diagState === "error"
+  ) {
+    return diagState;
+  }
+  if (diagState === "active" || diagState === "running") return "active";
+  if (diagState === "completed") return "done";
+  if (diagState === "failed") return "error";
+  return undefined;
 }
 
 /** Mirror of `firstTextPreview()` in session-tracker.ts, but parses JSON first. */
@@ -1004,6 +1127,14 @@ interface KnownUserRow {
 interface KnownGroupRow {
   chat_id: string;
   group_name: string;
+  source: string;
+  updated_at: number;
+}
+
+interface KnownCronJobRow {
+  job_id: string;
+  job_name: string;
+  enabled: number | null;
   source: string;
   updated_at: number;
 }

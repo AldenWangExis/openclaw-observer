@@ -98,7 +98,21 @@ export class SessionTracker {
       st.parentSessionKey = evt.parentSessionKey;
     }
 
-    // Status from hook events (diag events don't change status here)
+    // Status from diagnostic session state (highest priority when present).
+    // This tracks runtime truth more closely for queue transitions such as
+    // message_start/message_completed where hook events may be sparse.
+    if (evt.category === "diag" && evt.type === "session.state") {
+      const next = statusFromDiagPayload(evt.payload, st.currentAction);
+      if (next) {
+        st.status = next;
+        if (next === "idle" || next === "done") {
+          st.currentAction = undefined;
+          st.currentActionStart = undefined;
+        }
+      }
+    }
+
+    // Hook-derived status remains as fallback when diag session.state is absent.
     if (evt.category === "hook" && STATUS_FROM_HOOK[evt.type]) {
       const next = STATUS_FROM_HOOK[evt.type] as SessionStatus;
       st.status = next;
@@ -161,6 +175,30 @@ export class SessionTracker {
     }
     if (oldestKey) this.sessions.delete(oldestKey);
   }
+}
+
+function statusFromDiagPayload(
+  payload: Record<string, unknown>,
+  currentAction: string | undefined,
+): SessionStatus | undefined {
+  const state = typeof payload["state"] === "string" ? payload["state"] : undefined;
+  const reason = typeof payload["reason"] === "string" ? payload["reason"] : undefined;
+  if (!state) return undefined;
+
+  // Common runtime states emitted by diagnostic session.state events.
+  if (state === "idle") return reason === "run_completed" ? "done" : "idle";
+  if (state === "processing") {
+    return currentAction?.startsWith("tool:") ? "tool" : "thinking";
+  }
+
+  // Accept direct status-like values when runtimes expose them.
+  if (state === "thinking" || state === "tool" || state === "done" || state === "error") {
+    return state;
+  }
+  if (state === "active" || state === "running") return "active";
+  if (state === "completed") return "done";
+  if (state === "failed") return "error";
+  return undefined;
 }
 
 // ────────────────────────────────────────────────────────────────────────

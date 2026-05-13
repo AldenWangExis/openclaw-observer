@@ -80,6 +80,9 @@ export interface SessionState {
   channel?: string;
   groupChatId?: string;
   groupName?: string;
+  cronJobId?: string;
+  cronRunId?: string;
+  cronJobName?: string;
   firstSeen: number;
   lastSeen: number;
   status: SessionStatus;

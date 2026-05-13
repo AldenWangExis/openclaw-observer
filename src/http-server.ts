@@ -10,6 +10,7 @@
  *   GET  /api/stats          →  { bus, storage }
  *   GET  /api/events         →  query recent events (see params)
  *   GET  /api/groups         →  known group aliases from SQLite
+ *   GET  /api/cron-jobs      →  known cron job aliases from SQLite
  *   GET  /ws                 →  websocket; initial backlog + live stream
  *
  * All handlers wrap in try/catch; errors emit 500 without leaking stacks.
@@ -154,6 +155,9 @@ export class ObserverHttpServer {
     }
     if (url.pathname === "/api/groups") {
       return this.sendGroups(res, url);
+    }
+    if (url.pathname === "/api/cron-jobs") {
+      return this.sendCronJobs(res, url);
     }
     if (url.pathname === "/api/events") {
       return this.sendEvents(res, url);
@@ -373,6 +377,15 @@ export class ObserverHttpServer {
     }
     const groups = this.storage.listKnownGroups({ limit });
     return this.sendJson(res, 200, { source: "db", count: groups.length, groups });
+  }
+
+  private sendCronJobs(res: ServerResponse, url: URL): void {
+    const limit = clamp(parseIntOr(url.searchParams.get("limit"), 200), 1, 1000);
+    if (!this.storage?.isReady()) {
+      return this.sendJson(res, 200, { source: "bus", count: 0, cronJobs: [] });
+    }
+    const cronJobs = this.storage.listKnownCronJobs({ limit });
+    return this.sendJson(res, 200, { source: "db", count: cronJobs.length, cronJobs });
   }
 
   // ────────────────────────────────────────────────────────────────────
