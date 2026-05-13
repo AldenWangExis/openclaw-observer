@@ -95,3 +95,25 @@ export function parseGroupChatIdFromSessionKey(sessionKey: string | undefined): 
   const m = sessionKey.match(/^agent:[^:]+:[^:]+:group:(oc_[A-Za-z0-9]+)$/);
   return m?.[1];
 }
+
+export interface ParsedCronSessionKey {
+  cronJobId: string;
+  cronRunId?: string;
+}
+
+/**
+ * Parse cron identifiers from session key:
+ *   agent:<agent>:cron:<job_id>
+ *   agent:<agent>:cron:<job_id>:run:<run_id>
+ */
+export function parseCronSessionKey(
+  sessionKey: string | undefined,
+): ParsedCronSessionKey | undefined {
+  if (!sessionKey) return undefined;
+  const m = sessionKey.match(/^agent:[^:]+:cron:([^:]+)(?::run:([^:]+))?$/);
+  if (!m?.[1]) return undefined;
+  return {
+    cronJobId: m[1],
+    cronRunId: m[2] || undefined,
+  };
+}

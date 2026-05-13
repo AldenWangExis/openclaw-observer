@@ -188,6 +188,7 @@ const state = {
   sessions: new Map(),   // sessionKey → summary
   usersByOpenId: new Map(), // openId -> display name (from /api/users)
   groupsByChatId: new Map(), // chatId -> group display name (from /api/groups)
+  cronJobsById: new Map(), // cron jobId -> display name (from /api/cron-jobs)
   tokens: null,          // latest /api/tokens snapshot
   selectedEventId: null,
   selectedSessionKey: null,
@@ -414,6 +415,13 @@ function parseGroupChatId(sessionKey) {
   return m ? m[1] : null;
 }
 
+function parseCronSessionKey(sessionKey) {
+  if (!sessionKey) return null;
+  const m = sessionKey.match(/^agent:[^:]+:cron:([^:]+)(?::run:([^:]+))?$/);
+  if (!m) return null;
+  return { cronJobId: m[1], cronRunId: m[2] || null };
+}
+
 function sessionTitleForDisplay(session) {
   // DM: open_id -> username
   const dmOpenId = parseDmOpenId(session.sessionKey);
@@ -423,6 +431,12 @@ function sessionTitleForDisplay(session) {
   const groupChatId = session.groupChatId || parseGroupChatId(session.sessionKey);
   if (groupChatId) {
     return session.groupName || state.groupsByChatId.get(groupChatId) || groupChatId;
+  }
+
+  // Cron: job_id -> cron job name
+  const cron = parseCronSessionKey(session.sessionKey);
+  if (cron?.cronJobId) {
+    return session.cronJobName || state.cronJobsById.get(cron.cronJobId) || cron.cronJobId;
   }
 
   // Fallback: keep original non-chat session rendering behavior.
@@ -1123,12 +1137,13 @@ document.addEventListener("keydown", (ev) => {
 
 async function pollAux() {
   try {
-    const [sRes, tRes, stRes, uRes, gRes] = await Promise.all([
+    const [sRes, tRes, stRes, uRes, gRes, cRes] = await Promise.all([
       fetch("/api/sessions").then((r) => r.json()).catch(() => null),
       fetch("/api/tokens").then((r) => r.json()).catch(() => null),
       fetch("/api/stats").then((r) => r.json()).catch(() => null),
       fetch("/api/users").then((r) => r.json()).catch(() => null),
       fetch("/api/groups").then((r) => r.json()).catch(() => null),
+      fetch("/api/cron-jobs").then((r) => r.json()).catch(() => null),
     ]);
     if (sRes && Array.isArray(sRes.sessions)) {
       // Merge server truth into local (server is authoritative for status)
@@ -1140,6 +1155,9 @@ async function pollAux() {
           channel: s.channel,
           groupChatId: s.groupChatId,
           groupName: s.groupName,
+          cronJobId: s.cronJobId,
+          cronRunId: s.cronRunId,
+          cronJobName: s.cronJobName,
           firstSeen: s.firstSeen,
           lastSeen: s.lastSeen,
           status: s.status,
@@ -1171,6 +1189,15 @@ async function pollAux() {
         if (!g || !g.chatId) continue;
         // Prefer human-readable groupName; fallback to chatId.
         state.groupsByChatId.set(g.chatId, g.groupName || g.chatId);
+      }
+      renderSessions();
+    }
+    if (cRes && Array.isArray(cRes.cronJobs)) {
+      state.cronJobsById.clear();
+      for (const j of cRes.cronJobs) {
+        if (!j || !j.jobId) continue;
+        // Prefer readable cron job name; fallback to job id.
+        state.cronJobsById.set(j.jobId, j.jobName || j.jobId);
       }
       renderSessions();
     }
