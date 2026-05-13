@@ -398,6 +398,16 @@ function fmtUtc8Seconds(ms) {
   return `${yyyy}-${mo}-${dd} ${hh}:${mm}:${ss} UTC+8`;
 }
 
+const STATUS_LABEL = {
+  active:   "活跃",
+  thinking: "思考",
+  tool:     "工具",
+  idle:     "空闲",
+  done:     "完成",
+  error:    "错误",
+};
+function statusLabel(s) { return STATUS_LABEL[s] ?? s; }
+
 function shortKey(s, n = 40) {
   if (!s) return "";
   return s.length <= n ? s : s.slice(0, n - 1) + "…";
@@ -512,7 +522,7 @@ function renderSessions() {
     const chan = s.channel ? `[${s.channel}]` : "";
     item.innerHTML =
       `<div class="s-line1">` +
-        `<span class="s-pill status-${s.status}">${s.status}</span>` +
+        `<span class="s-pill status-${s.status}">${statusLabel(s.status)}</span>` +
         `<span class="s-title">${title} ${chan}</span>` +
       `</div>` +
       `<div class="s-line2">` +

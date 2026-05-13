@@ -511,8 +511,9 @@ export class Storage {
    * - title       = first text-like field of the earliest message_received
    *   payload, mirroring `firstTextPreview()` in the tracker
    *
-   * Performance: composite query uses three window-function sub-queries
-   * (last_status, last_action, first_msg). All indexed on session_key/ts.
+   * Performance: composite query uses four window-function sub-queries
+   * (last_status, last_action, last_diag_state, first_msg). All indexed on
+   * session_key/ts.
    * For ~10⁵ rows the query is sub-millisecond on a warm cache; for ~10⁶
    * still well under 100ms.
    *
@@ -612,6 +613,18 @@ export class Storage {
           WHERE category = 'hook' AND type IN (${actionPlaceholders}) AND ts >= ?
         ) WHERE rn = 1
       ),
+      last_diag_state AS (
+        SELECT session_key, ts, diag_state, diag_reason FROM (
+          SELECT
+            session_key,
+            ts,
+            json_extract(payload, '$.state') AS diag_state,
+            json_extract(payload, '$.reason') AS diag_reason,
+            ROW_NUMBER() OVER (PARTITION BY session_key ORDER BY ts DESC, seq DESC) AS rn
+          FROM events
+          WHERE category = 'diag' AND type = 'session.state' AND ts >= ?
+        ) WHERE rn = 1
+      ),
       first_msg AS (
         SELECT session_key, payload FROM (
           SELECT session_key, payload,
@@ -632,12 +645,16 @@ export class Storage {
         last_action.ts     AS action_ts,
         last_action.tool_name AS action_tool,
         last_action.model     AS action_model,
+        last_diag_state.diag_state,
+        last_diag_state.diag_reason,
+        last_diag_state.ts AS diag_ts,
         first_msg.payload AS first_msg_payload
       FROM base
       LEFT JOIN group_alias ga ON ga.chat_id = base.group_chat_id
       LEFT JOIN cron_job_alias cja ON cja.job_id = base.cron_job_id
       LEFT JOIN last_status ON last_status.session_key = base.session_key
       LEFT JOIN last_action ON last_action.session_key = base.session_key
+      LEFT JOIN last_diag_state ON last_diag_state.session_key = base.session_key
       LEFT JOIN first_msg   ON first_msg.session_key   = base.session_key
       ORDER BY base.last_seen DESC
       LIMIT ?
@@ -650,6 +667,7 @@ export class Storage {
         ...STATUS_TYPES,
         sinceTs,
         ...ACTION_TYPES,
+        sinceTs,
         sinceTs,
         sinceTs,
         limit,
@@ -876,6 +894,9 @@ interface SessionRow {
   action_ts: number | null;
   action_tool: string | null;
   action_model: string | null;
+  diag_state: string | null;
+  diag_reason: string | null;
+  diag_ts: number | null;
   first_msg_payload: string | null;
 }
 
@@ -894,12 +915,15 @@ const STATUS_FROM_HOOK: Record<string, SessionStatus> = {
 };
 
 function rowToSessionState(r: SessionRow): SessionState {
+  const hookStatus: SessionStatus = r.status_type
+    ? (STATUS_FROM_HOOK[r.status_type] ?? "active")
+    : "active";
   const state: SessionState = {
     sessionKey: r.session_key,
     firstSeen: r.first_seen,
     lastSeen: r.last_seen,
     eventCount: r.event_count,
-    status: r.status_type ? (STATUS_FROM_HOOK[r.status_type] ?? "active") : "active",
+    status: hookStatus,
     tokens: {
       input: r.t_in,
       output: r.t_out,
@@ -933,12 +957,45 @@ function rowToSessionState(r: SessionRow): SessionState {
   // after_tool_call / llm_output / session_end → leave currentAction
   // undefined (the tracker would have cleared them too).
 
+  const diagStatus = statusFromDiagState(r.diag_state, r.diag_reason, r.action_type);
+  if (diagStatus) {
+    state.status = diagStatus;
+    if (diagStatus === "idle" || diagStatus === "done") {
+      state.currentAction = undefined;
+      state.currentActionStart = undefined;
+    }
+  }
+
   if (r.first_msg_payload) {
     const title = extractTitle(r.first_msg_payload);
     if (title) state.title = title;
   }
 
   return state;
+}
+
+function statusFromDiagState(
+  diagState: string | null,
+  diagReason: string | null,
+  actionType: string | null,
+): SessionStatus | undefined {
+  if (!diagState) return undefined;
+  if (diagState === "idle") return diagReason === "run_completed" ? "done" : "idle";
+  if (diagState === "processing") {
+    return actionType === "before_tool_call" ? "tool" : "thinking";
+  }
+  if (
+    diagState === "thinking" ||
+    diagState === "tool" ||
+    diagState === "done" ||
+    diagState === "error"
+  ) {
+    return diagState;
+  }
+  if (diagState === "active" || diagState === "running") return "active";
+  if (diagState === "completed") return "done";
+  if (diagState === "failed") return "error";
+  return undefined;
 }
 
 /** Mirror of `firstTextPreview()` in session-tracker.ts, but parses JSON first. */
